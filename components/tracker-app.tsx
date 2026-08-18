@@ -573,11 +573,25 @@ export function TrackerApp() {
     setSelectedItemUses(null);
     setItemUsesLoading(true);
     try {
-      const response = await fetch(`/api/tarkov/${mode}/uses?itemId=${encodeURIComponent(item.id)}`);
+      const response = await fetch(`/api/tarkov/${mode}/uses?itemId=${encodeURIComponent(item.id)}`, {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache" },
+      });
       if (!response.ok) throw new Error("Não foi possível carregar as trocas/receitas deste item.");
-      const payload = await response.json() as ItemUsesData;
+      const rawPayload = await response.json() as unknown;
+      // Accept both our direct response and an envelope in case a platform/proxy
+      // serializes a function response as { data: ... }.
+      const payloadCandidate = rawPayload && typeof rawPayload === "object" && "data" in rawPayload
+        ? (rawPayload as { data?: unknown }).data
+        : rawPayload;
+      const payload = payloadCandidate as ItemUsesData;
       if (!payload || payload.itemId !== item.id || !Array.isArray(payload.barters) || !Array.isArray(payload.crafts)) {
-        throw new Error("A API respondeu em um formato inesperado.");
+        const returnedId = payload && typeof payload === "object" && "itemId" in payload
+          ? String((payload as { itemId?: unknown }).itemId ?? "")
+          : "";
+        throw new Error(returnedId && returnedId !== item.id
+          ? "A hospedagem respondeu com dados em cache de outro item. Recarregue a página após publicar a versão mais recente."
+          : "A API respondeu em um formato inesperado.");
       }
       setItemUsesCache((current) => ({ ...current, [cacheKey]: payload }));
       setSelectedItemUses(payload);

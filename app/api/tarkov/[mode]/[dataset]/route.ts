@@ -1,6 +1,12 @@
 import { NextResponse } from "next/server";
 import type { GameMode } from "@/lib/types";
 
+// These API routes proxy live Tarkov data. Keep the route handler dynamic in
+// production hosts such as Netlify/OpenNext so query-dependent responses are
+// never reused as a Next.js route-cache entry.
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
 const MODES = new Set<GameMode>(["regular", "pve", "pvp-season"]);
 const DATASETS = new Set(["items", "hideout", "tasks", "traders", "maps", "uses", "sell-prices"]);
 const BILINGUAL_KEYS = new Set(["name", "shortName", "description", "title"]);
@@ -721,13 +727,26 @@ export async function GET(
       // maintained for compatibility but is known to be intermittently unavailable.
       const payload = await fetchStaticItemUses(mode as GameMode, itemId);
       return NextResponse.json(payload, {
-        headers: { "Cache-Control": "public, max-age=300, s-maxage=1800, stale-while-revalidate=300" },
+        headers: {
+          // Item Intelligence is keyed by ?itemId=. Do not let a hosting/CDN
+          // layer reuse another item's payload. The large upstream barter/craft
+          // datasets are already cached inside this function instance.
+          "Cache-Control": "no-store, max-age=0",
+          "Netlify-CDN-Cache-Control": "no-store",
+          "Netlify-Vary": "query=itemId",
+          "X-Tarkov-Item-Id": itemId,
+        },
       });
     } catch (staticError) {
       try {
         const payload = await fetchGraphQlItemUses(mode as GameMode, itemId);
         return NextResponse.json(payload, {
-          headers: { "Cache-Control": "public, max-age=120, s-maxage=600, stale-while-revalidate=120" },
+          headers: {
+            "Cache-Control": "no-store, max-age=0",
+            "Netlify-CDN-Cache-Control": "no-store",
+            "Netlify-Vary": "query=itemId",
+            "X-Tarkov-Item-Id": itemId,
+          },
         });
       } catch (graphError) {
         const staticDetail = staticError instanceof Error ? staticError.message : "unknown static error";
