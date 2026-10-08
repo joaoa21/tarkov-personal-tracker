@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ModeSwitcher } from "./mode-switcher";
 import {
   bestSellPrice,
@@ -15,12 +15,26 @@ import {
   missingTaskRequirements,
   valuePerSlot,
 } from "@/lib/hideout-engine";
-import { buildKeyInfos, keyRaidDecision } from "@/lib/key-engine";
+import { buildKeyInfos, isKeyItem, keyRaidDecision } from "@/lib/key-engine";
 import { normalizeHideout, normalizeItems, normalizeMaps, normalizeTasks, normalizeTraders } from "@/lib/normalize";
-import { createTrackerBackup, EMPTY_PROGRESS, loadProgress, restoreTrackerBackup, saveProgress } from "@/lib/storage";
+import {
+  clearResetSnapshot,
+  createTrackerBackup,
+  EMPTY_PROGRESS,
+  loadProgress,
+  loadResetSnapshot,
+  resetProgress,
+  restoreTrackerBackup,
+  saveProgress,
+  saveResetSnapshot,
+  type ResetScope,
+  type ResetSnapshot,
+} from "@/lib/storage";
+import { storyChapterProgress, type StoryChapter, type StoryData } from "@/lib/story";
 import { AVATAR_PRESETS, CURRENCY_BY_ITEM_ID } from "@/lib/types";
 import type {
   CurrencyCode,
+  Faction,
   GameMode,
   HideoutStation,
   ItemNeed,
@@ -36,10 +50,11 @@ import type {
   TarkovMap,
   TarkovTask,
   TarkovTrader,
+  TaskSortMode,
   TaskStatusFilter,
 } from "@/lib/types";
 
-type View = "keep" | "hideout" | "raid" | "keys" | "profile" | "quests" | "board" | "kappa" | "lightkeeper";
+type View = "keep" | "hideout" | "raid" | "keys" | "profile" | "quests" | "story" | "board" | "kappa" | "lightkeeper";
 type QuestBoardFilter = "all" | "fir" | "keys" | "kappa" | "lightkeeper";
 const KEEP_COVER_GRACE_MS = 3000;
 
@@ -132,12 +147,13 @@ export function TrackerApp() {
   const [view, setView] = useState<View>("keep");
   const [keepFilter, setKeepFilter] = useState<KeepFilter>("all");
   const [taskFilter, setTaskFilter] = useState<TaskStatusFilter>("all");
+  const [taskSort, setTaskSort] = useState<TaskSortMode>("game");
   const [boardFilter, setBoardFilter] = useState<QuestBoardFilter>("all");
   const [keyMapFilter, setKeyMapFilter] = useState("all");
   const [traderFilter, setTraderFilter] = useState("all");
   const [items, setItems] = useState<TarkovItem[]>([]);
   const [stations, setStations] = useState<HideoutStation[]>([]);
-  const [tasks, setTasks] = useState<TarkovTask[]>([]);
+  const [allTasks, setTasks] = useState<TarkovTask[]>([]);
   const [traders, setTraders] = useState<TarkovTrader[]>([]);
   const [maps, setMaps] = useState<TarkovMap[]>([]);
   const [progress, setProgress] = useState<ProfileProgress>(EMPTY_PROGRESS);
@@ -156,7 +172,13 @@ export function TrackerApp() {
   const [questWikiLoading, setQuestWikiLoading] = useState(false);
   const [questWikiError, setQuestWikiError] = useState<string | null>(null);
   const [questWikiCache, setQuestWikiCache] = useState<Record<string, QuestWikiData>>({});
+  const [story, setStory] = useState<StoryData | null>(null);
+  const [storyLoading, setStoryLoading] = useState(false);
+  const [storyError, setStoryError] = useState<string | null>(null);
   const [recentlyCoveredKeep, setRecentlyCoveredKeep] = useState<Set<string>>(() => new Set());
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetSnapshot, setResetSnapshot] = useState<ResetSnapshot | null>(null);
+  const [toast, setToast] = useState<{ message: string; undo?: boolean } | null>(null);
   const [backupStatus, setBackupStatus] = useState<{ kind: "success" | "error"; message: string } | null>(null);
   const backupInputRef = useRef<HTMLInputElement>(null);
   const keepCoverTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
@@ -178,7 +200,21 @@ export function TrackerApp() {
   useEffect(() => {
     setProgress(loadProgress(mode));
     setProgressMode(mode);
+    setResetSnapshot(loadResetSnapshot(mode));
+    setToast(null);
   }, [mode]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), toast.undo ? 12000 : 5000);
+    return () => clearTimeout(timer);
+  }, [toast]);
+
+  // Quests for the other faction (BEAR/USEC-only) are hidden once the PMC faction is known.
+  const tasks = useMemo(
+    () => allTasks.filter((task) => task.factionName === "Any" || !progress.faction || task.factionName === progress.faction),
+    [allTasks, progress.faction],
+  );
 
   useEffect(() => {
     if (progressMode === mode) saveProgress(mode, progress);
@@ -190,11 +226,11 @@ export function TrackerApp() {
     setError(null);
 
     Promise.all([
-      fetch(`/api/tarkov/${mode}/items`).then(checkJson("itens")),
-      fetch(`/api/tarkov/${mode}/hideout`).then(checkJson("Hideout")),
-      fetch(`/api/tarkov/${mode}/tasks`).then(checkJson("missões")),
-      fetch(`/api/tarkov/${mode}/traders`).then(checkJson("traders")),
-      fetch(`/api/tarkov/${mode}/maps`).then(checkJson("mapas")),
+      loadDataset(`/api/tarkov/${mode}/items`, "itens"),
+      loadDataset(`/api/tarkov/${mode}/hideout`, "Hideout"),
+      loadDataset(`/api/tarkov/${mode}/tasks`, "missões"),
+      loadDataset(`/api/tarkov/${mode}/traders`, "traders"),
+      loadDataset(`/api/tarkov/${mode}/maps`, "mapas"),
     ])
       .then(([itemsPayload, hideoutPayload, tasksPayload, tradersPayload, mapsPayload]) => {
         if (cancelled) return;
@@ -318,7 +354,7 @@ export function TrackerApp() {
         items: [...group.items.values()].sort((a, b) => Number(b.globalMissing > 0) - Number(a.globalMissing > 0) || Number(b.foundInRaid) - Number(a.foundInRaid) || b.globalMissing - a.globalMissing || b.required - a.required || a.item.name.localeCompare(b.item.name)),
         keys: [...group.keys.values()].sort((a, b) => Number(a.info.owned > 0) - Number(b.info.owned > 0) || a.info.item.name.localeCompare(b.info.item.name)),
       }];
-    }).sort((a, b) => a.trader.name.localeCompare(b.trader.name));
+    }).sort((a, b) => traderRank(a.trader) - traderRank(b.trader) || a.trader.name.localeCompare(b.trader.name));
   }, [tasks, traders, progress, itemMap, questNeedByItem, keyInfos, taskById]);
 
   const selectedNeeds = keepFilter === "hideout" ? hideoutNeeds
@@ -500,6 +536,40 @@ export function TrackerApp() {
     setProgress((current) => ({ ...current, avatarPreset }));
   }
 
+  function setFaction(faction: Faction | null) {
+    setProgress((current) => ({ ...current, faction }));
+  }
+
+  function setPrestigeLevel(level: number) {
+    const safe = Math.min(10, Math.max(0, Math.floor(Number.isFinite(level) ? level : 0)));
+    setProgress((current) => ({ ...current, prestigeLevel: safe }));
+  }
+
+  function performReset(scope: ResetScope, nextPrestigeLevel: number) {
+    const keyItemIds = new Set(items.filter(isKeyItem).map((item) => item.id));
+    saveResetSnapshot(mode, progress);
+    setResetSnapshot(loadResetSnapshot(mode));
+    setProgress(resetProgress(progress, scope, keyItemIds, nextPrestigeLevel));
+    setResetOpen(false);
+    setTaskFilter("all");
+    setTraderFilter("all");
+    setToast({
+      message: nextPrestigeLevel > progress.prestigeLevel
+        ? `Personagem resetado — Prestígio ${nextPrestigeLevel}. Boa sorte na nova jornada!`
+        : "Personagem resetado.",
+      undo: true,
+    });
+  }
+
+  function undoReset() {
+    const snapshot = loadResetSnapshot(mode);
+    if (!snapshot) return;
+    setProgress(snapshot.progress);
+    clearResetSnapshot(mode);
+    setResetSnapshot(null);
+    setToast({ message: "Reset desfeito. Progresso anterior restaurado." });
+  }
+
   function exportTrackerBackup() {
     try {
       const backup = createTrackerBackup();
@@ -633,6 +703,41 @@ export function TrackerApp() {
     }
   }
 
+  const loadStory = useCallback(async () => {
+    setStoryLoading(true);
+    setStoryError(null);
+    try {
+      const response = await fetch("/api/wiki/story");
+      const payload = await response.json() as StoryData & { error?: string };
+      if (!response.ok || !Array.isArray(payload.chapters)) throw new Error(payload.error ?? "Não foi possível carregar o modo história.");
+      setStory(payload);
+    } catch (reason) {
+      setStoryError(reason instanceof Error ? reason.message : "Wiki indisponível.");
+    } finally {
+      setStoryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (view === "story" && !story && !storyLoading && !storyError) void loadStory();
+  }, [view, story, storyLoading, storyError, loadStory]);
+
+  function setStoryStep(stepId: string, done: boolean) {
+    setProgress((current) => ({ ...current, storySteps: { ...current.storySteps, [stepId]: done } }));
+  }
+
+  function setStoryChapterDone(chapter: StoryChapter, done: boolean) {
+    setProgress((current) => ({ ...current, storyChapters: { ...current.storyChapters, [chapter.id]: done } }));
+  }
+
+  function clearStoryChapter(chapter: StoryChapter) {
+    setProgress((current) => {
+      const storySteps = { ...current.storySteps };
+      for (const step of chapter.steps) delete storySteps[step.id];
+      return { ...current, storySteps, storyChapters: { ...current.storyChapters, [chapter.id]: false } };
+    });
+  }
+
   function closeTaskIntel() {
     setSelectedTask(null);
     setQuestWiki(null);
@@ -646,9 +751,46 @@ export function TrackerApp() {
     if (next === "board") setBoardFilter("all");
   }
 
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (resetOpen) setResetOpen(false);
+      else if (selectedTask) closeTaskIntel();
+      else if (selectedItem) closeItemUses();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [resetOpen, selectedTask, selectedItem]);
+
+  const pendingQuestCount = tasks.length - completedCount;
+  const keepCount = allNeeds.filter((need) => !need.currency && need.missing > 0).length;
+  const modeLabel = mode === "pve" ? "Persistent PvE" : mode === "regular" ? "Persistent PvP" : "Seasonal PMC";
+  const navGroups: Array<{ label: string; tabs: Array<{ id: View; icon: string; label: string; count?: number }> }> = [
+    {
+      label: "Stash",
+      tabs: [
+        { id: "keep", icon: "▦", label: "Itens a guardar", count: keepCount },
+        { id: "raid", icon: "⌖", label: "Raid Mode" },
+        { id: "keys", icon: "◆", label: "Chaves" },
+      ],
+    },
+    {
+      label: "Progresso",
+      tabs: [
+        { id: "quests", icon: "✓", label: "Missões", count: pendingQuestCount },
+        { id: "story", icon: "❖", label: "História", count: story ? story.chapters.filter((chapter) => !progress.storyChapters[chapter.id]).length : undefined },
+        { id: "board", icon: "▥", label: "Quest Board" },
+        { id: "hideout", icon: "⌂", label: "Hideout" },
+        { id: "kappa", icon: "K", label: "Kappa", count: kappaTasks.length - kappaCompleted },
+        { id: "lightkeeper", icon: "L", label: "Lightkeeper", count: lightkeeperTasks.length - lightkeeperCompleted },
+      ],
+    },
+    { label: "PMC", tabs: [{ id: "profile", icon: "◉", label: "Perfil" }] },
+  ];
+
   return (
     <main className="shell">
-      <header className="game-header">
+      <header className="topbar">
         <div className="brand-lockup">
           <div className="brand-mark" aria-hidden="true"><span /><span /><span /></div>
           <div>
@@ -659,73 +801,73 @@ export function TrackerApp() {
         <ModeSwitcher mode={mode} onChange={(next) => { setMode(next); setQuery(""); setTraderFilter("all"); closeItemUses(); closeTaskIntel(); }} />
       </header>
 
-      <section className="pmc-command-card">
-        <div className="pmc-profile-main">
-          <PmcAvatar mode={mode} level={progress.playerLevel} avatarPreset={progress.avatarPreset} />
-          <div className="pmc-identity">
-            <div className="pmc-kicker"><span className={`mode-dot ${mode}`} /> PERFIL ATIVO</div>
-            <div className="pmc-name-row">
-              <div>
-                <strong>PMC</strong>
-                <span>{mode === "pve" ? "Persistent PvE" : mode === "regular" ? "Persistent PvP" : "Seasonal PMC"}</span>
-              </div>
-              <button type="button" className="profile-edit-link" onClick={() => switchView("profile")}>EDITAR PERFIL</button>
-            </div>
-            <div className="pmc-level-line">
-              <span>LEVEL</span>
-              <b>{progress.playerLevel}</b>
-              <i />
-            </div>
+      <section className="pmc-strip">
+        <PmcAvatar mode={mode} level={progress.playerLevel} avatarPreset={progress.avatarPreset} />
+        <div className="pmc-identity">
+          <div className="pmc-kicker"><span className={`mode-dot ${mode}`} /> {modeLabel}</div>
+          <div className="pmc-name-row">
+            <strong>PMC</strong>
+            <span className={`faction-badge ${progress.faction?.toLowerCase() ?? "unset"}`}>{progress.faction ?? "Facção?"}</span>
+            {progress.prestigeLevel > 0 && <span className="prestige-badge" title="Nível de prestígio">★ Prestígio {progress.prestigeLevel}</span>}
+          </div>
+          <div className="pmc-level-line">
+            <span>LEVEL</span>
+            <b>{progress.playerLevel}</b>
+            <i><em style={{ width: `${questPercent}%` }} /></i>
+            <small>{questPercent}% quests</small>
           </div>
         </div>
-        <div className="wallet-panel">
-          <div className="wallet-title">STASH VALUE / CASH</div>
-          <div className="wallet-grid">
-            <div className="wallet-stat rub"><span>RUB</span><strong>{currencyAmount("RUB", progress.wallet.RUB)}</strong><small>Roubles</small></div>
-            <div className="wallet-stat usd"><span>USD</span><strong>{currencyAmount("USD", progress.wallet.USD)}</strong><small>Dollars</small></div>
-            <div className="wallet-stat eur"><span>EUR</span><strong>{currencyAmount("EUR", progress.wallet.EUR)}</strong><small>Euros</small></div>
-          </div>
+        <div className="wallet-grid">
+          <div className="wallet-stat rub"><span>RUB</span><strong>{currencyAmount("RUB", progress.wallet.RUB)}</strong></div>
+          <div className="wallet-stat usd"><span>USD</span><strong>{currencyAmount("USD", progress.wallet.USD)}</strong></div>
+          <div className="wallet-stat eur"><span>EUR</span><strong>{currencyAmount("EUR", progress.wallet.EUR)}</strong></div>
+        </div>
+        <div className="pmc-actions">
+          <button type="button" className="ghost-button" onClick={() => switchView("profile")}>✎ Editar perfil</button>
+          <button type="button" className="danger-button" onClick={() => setResetOpen(true)}>↺ Resetar personagem</button>
         </div>
       </section>
 
-      <section className="summary-grid game-summary-grid">
-        <button className="summary-card game-stat-card" type="button" onClick={() => switchView("hideout")}>
-          <div className="game-stat-head"><span>HIDEOUT</span><b>{hideoutPercent}%</b></div>
-          <strong>{finishedStations}<i>/ {stations.length || "—"}</i></strong>
-          <small>estações maximizadas</small>
-          <div className="stat-progress"><i style={{ width: `${hideoutPercent}%` }} /></div>
-        </button>
-        <button className="summary-card game-stat-card" type="button" onClick={() => switchView("keep")}>
-          <div className="game-stat-head"><span>ITEMS TO KEEP</span><b>STASH</b></div>
-          <strong>{allNeeds.filter((need) => !need.currency && need.missing > 0).length}</strong>
-          <small>tipos ainda necessários</small>
-          <div className="stat-meta-line"><span>Hideout + Quests</span><span>PT / EN</span></div>
-        </button>
-        <button className="summary-card game-stat-card" type="button" onClick={() => switchView("keep")}>
-          <div className="game-stat-head"><span>MATERIAIS</span><b>PHYSICAL</b></div>
-          <strong>{number.format(missingUnits)}</strong>
-          <small>unidades físicas do Hideout</small>
-          <div className="stat-meta-line"><span>sem moedas</span><span>restantes</span></div>
-        </button>
-        <button className="summary-card game-stat-card quest-stat-card" type="button" onClick={() => switchView("quests")}>
-          <div className="game-stat-head"><span>QUESTS</span><b>{questPercent}%</b></div>
+      <section className="summary-grid">
+        <button className="summary-card" type="button" onClick={() => switchView("quests")}>
+          <div className="summary-head"><span>Quests</span><b>{questPercent}%</b></div>
           <strong>{completedCount}<i>/ {tasks.length || "—"}</i></strong>
-          <small>concluídas neste personagem</small>
           <div className="stat-progress"><i style={{ width: `${questPercent}%` }} /></div>
-          <div className="quest-mini-meta"><span>Kappa {kappaCompleted}/{kappaTasks.length}</span><span>LK {lightkeeperCompleted}/{lightkeeperTasks.length}</span></div>
+          <div className="stat-meta-line"><span>Kappa {kappaCompleted}/{kappaTasks.length}</span><span>LK {lightkeeperCompleted}/{lightkeeperTasks.length}</span></div>
+        </button>
+        <button className="summary-card" type="button" onClick={() => switchView("hideout")}>
+          <div className="summary-head"><span>Hideout</span><b>{hideoutPercent}%</b></div>
+          <strong>{finishedStations}<i>/ {stations.length || "—"}</i></strong>
+          <div className="stat-progress"><i style={{ width: `${hideoutPercent}%` }} /></div>
+          <div className="stat-meta-line"><span>estações maximizadas</span></div>
+        </button>
+        <button className="summary-card" type="button" onClick={() => switchView("keep")}>
+          <div className="summary-head"><span>Itens a guardar</span><b>STASH</b></div>
+          <strong>{keepCount}</strong>
+          <div className="stat-meta-line"><span>tipos ainda necessários</span><span>Hideout + Quests</span></div>
+        </button>
+        <button className="summary-card" type="button" onClick={() => switchView("keep")}>
+          <div className="summary-head"><span>Materiais Hideout</span><b>FÍSICOS</b></div>
+          <strong>{number.format(missingUnits)}</strong>
+          <div className="stat-meta-line"><span>unidades restantes</span><span>sem moedas</span></div>
         </button>
       </section>
 
-      <nav className="tabs game-tabs">
-        <button className={view === "keep" ? "tab active" : "tab"} onClick={() => switchView("keep")}><span className="tab-icon">▦</span><span>Items to Keep</span></button>
-        <button className={view === "hideout" ? "tab active" : "tab"} onClick={() => switchView("hideout")}><span className="tab-icon">⌂</span><span>Hideout</span></button>
-        <button className={view === "raid" ? "tab active" : "tab"} onClick={() => switchView("raid")}><span className="tab-icon">⌖</span><span>Raid Mode</span></button>
-        <button className={view === "keys" ? "tab active" : "tab"} onClick={() => switchView("keys")}><span className="tab-icon">◆</span><span>Chaves</span></button>
-        <button className={view === "profile" ? "tab active" : "tab"} onClick={() => switchView("profile")}><span className="tab-icon">◉</span><span>Perfil</span></button>
-        <button className={view === "quests" ? "tab active" : "tab"} onClick={() => switchView("quests")}><span className="tab-icon">✓</span><span>Quests</span></button>
-        <button className={view === "board" ? "tab active" : "tab"} onClick={() => switchView("board")}><span className="tab-icon">▥</span><span>Quest Board</span></button>
-        <button className={view === "kappa" ? "tab active" : "tab"} onClick={() => switchView("kappa")}><span className="tab-icon">K</span><span>Kappa</span></button>
-        <button className={view === "lightkeeper" ? "tab active" : "tab"} onClick={() => switchView("lightkeeper")}><span className="tab-icon">L</span><span>Lightkeeper</span></button>
+      <nav className="tabs" aria-label="Seções">
+        {navGroups.map((group) => (
+          <div className="tab-group" key={group.label}>
+            <span className="tab-group-label">{group.label}</span>
+            <div className="tab-group-items">
+              {group.tabs.map((tab) => (
+                <button key={tab.id} type="button" className={view === tab.id ? "tab active" : "tab"} aria-current={view === tab.id ? "page" : undefined} onClick={() => switchView(tab.id)}>
+                  <span className="tab-icon">{tab.icon}</span>
+                  <span>{tab.label}</span>
+                  {!loading && tab.count !== undefined && tab.count > 0 && <span className="tab-count">{number.format(tab.count)}</span>}
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
       </nav>
 
       {error && <div className="error-banner">{error}</div>}
@@ -751,14 +893,15 @@ export function TrackerApp() {
 
       {!loading && view === "hideout" && (
         <section>
-          <div className="section-heading"><div><div className="eyebrow">PROFILE PROGRESS</div><h2>Níveis do Hideout</h2><p>Português primeiro e inglês em parênteses. Selecione o nível já construído em cada estação.</p></div></div>
+          <div className="section-heading"><div><div className="eyebrow">PROFILE PROGRESS</div><h2>Níveis do Hideout</h2><p>Selecione o nível já construído em cada estação. {finishedStations}/{stations.length} maximizadas.</p></div></div>
           <div className="station-grid">
             {stations.map((station) => {
               const current = progress.hideoutLevels[station.id] ?? 0;
               const max = stationMax(station);
               return (
-                <article className="station-card" key={station.id}>
-                  <div className="station-title">{station.imageLink ? <img src={station.imageLink} alt="" /> : null}<div><h3>{dual(station.name, station.nameEn)}</h3><span>Nível {current} / {max}</span></div></div>
+                <article className={current >= max ? "station-card maxed" : "station-card"} key={station.id}>
+                  <div className="station-title">{station.imageLink ? <img src={station.imageLink} alt="" /> : null}<div><h3>{dual(station.name, station.nameEn)}</h3><span>{current >= max ? "✓ Nível máximo" : `Nível ${current} / ${max}`}</span></div></div>
+                  <div className="station-progress"><i style={{ width: `${max ? Math.round((current / max) * 100) : 0}%` }} /></div>
                   <div className="level-buttons">{Array.from({ length: max + 1 }, (_, level) => <button key={level} type="button" className={current === level ? "level active" : "level"} onClick={() => setStationLevel(station.id, level)}>{level}</button>)}</div>
                 </article>
               );
@@ -791,7 +934,27 @@ export function TrackerApp() {
 
       {!loading && view === "profile" && (
         <section>
-          <div className="section-heading"><div><div className="eyebrow">CURRENT CHARACTER</div><h2>Perfil atual</h2><p>Level e moedas ficam separados por PvE, PvP e Season.</p></div></div>
+          <div className="section-heading"><div><div className="eyebrow">CURRENT CHARACTER</div><h2>Perfil atual</h2><p>Level, facção, prestígio e moedas ficam separados por PvE, PvP e Season.</p></div></div>
+          <div className="profile-identity-grid">
+            <div className="profile-field">
+              <span>Facção</span>
+              <div className="segmented">
+                {([["BEAR", "BEAR"], ["USEC", "USEC"], [null, "Não definida"]] as Array<[Faction | null, string]>).map(([id, label]) => (
+                  <button key={label} type="button" className={progress.faction === id ? "active" : ""} onClick={() => setFaction(id)}>{label}</button>
+                ))}
+              </div>
+              <small>{progress.faction ? `Missões exclusivas da outra facção ficam ocultas.` : "Defina para esconder missões exclusivas de BEAR/USEC que não são suas."}</small>
+            </div>
+            <div className="profile-field">
+              <span>Prestígio</span>
+              <div className="stash-stepper large">
+                <button type="button" aria-label="Diminuir prestígio" onClick={() => setPrestigeLevel(progress.prestigeLevel - 1)}>−</button>
+                <input type="number" min="0" max="10" value={progress.prestigeLevel} onChange={(event) => setPrestigeLevel(Number(event.target.value))} />
+                <button type="button" aria-label="Aumentar prestígio" onClick={() => setPrestigeLevel(progress.prestigeLevel + 1)}>+</button>
+              </div>
+              <small>Aumenta automaticamente ao resetar marcando "Fiz prestígio".</small>
+            </div>
+          </div>
           <div className="profile-grid">
             <ProfileField label="Nível do PMC" prefix="LVL" value={progress.playerLevel} min={1} onChange={setPlayerLevel} />
             <ProfileField label="Rublos" prefix="₽" value={progress.wallet.RUB} onChange={(value) => setWallet("RUB", value)} />
@@ -838,8 +1001,30 @@ export function TrackerApp() {
             </div>
             {backupStatus && <div className={`backup-status ${backupStatus.kind}`}>{backupStatus.message}</div>}
           </div>
+          <div className="danger-zone">
+            <div>
+              <div className="eyebrow">PRESTÍGIO / WIPE</div>
+              <h3>Resetar personagem</h3>
+              <p>Zera missões, Hideout, level e stash deste modo ({modeLabel}). Você escolhe o que manter, e pode desfazer depois.</p>
+              {resetSnapshot && <p className="danger-zone-undo">Último reset em {new Date(resetSnapshot.savedAt).toLocaleString("pt-BR")}. <button type="button" className="link-button" onClick={undoReset}>Restaurar progresso anterior</button></p>}
+            </div>
+            <button type="button" className="danger-button" onClick={() => setResetOpen(true)}>↺ Resetar personagem</button>
+          </div>
           <div className="currency-needs"><div className="eyebrow">HIDEOUT CASH REQUIREMENTS</div><h3>Custos monetários restantes</h3><div className="currency-cards">{(["RUB", "USD", "EUR"] as CurrencyCode[]).map((currency) => { const need = currencyNeeds.find((entry) => entry.currency === currency); return <div className="currency-card" key={currency}><span>{currency}</span><strong>{currencyAmount(currency, need?.missing ?? 0)}</strong><small>{need ? `${currencyAmount(currency, need.totalNeeded)} necessários · ${currencyAmount(currency, need.owned)} em caixa` : "Nada faltando para os upgrades restantes"}</small></div>; })}</div></div>
         </section>
+      )}
+
+      {!loading && view === "story" && (
+        <StorySection
+          story={story}
+          loading={storyLoading}
+          error={storyError}
+          progress={progress}
+          onRetry={() => void loadStory()}
+          onStep={setStoryStep}
+          onChapterDone={setStoryChapterDone}
+          onClearChapter={clearStoryChapter}
+        />
       )}
 
       {!loading && view === "board" && (
@@ -861,12 +1046,15 @@ export function TrackerApp() {
           progress={progress}
           itemMap={itemMap}
           traders={traders}
+          maps={maps}
           traderFilter={traderFilter}
           setTraderFilter={setTraderFilter}
           query={query}
           setQuery={setQuery}
           filter={taskFilter}
           setFilter={setTaskFilter}
+          sort={taskSort}
+          setSort={setTaskSort}
           onCompleted={setTaskCompleted}
           onCurrent={markCurrentTask}
           onInspectTask={inspectTask}
@@ -888,6 +1076,23 @@ export function TrackerApp() {
           onOwned={setOwned}
           onClose={closeItemUses}
         />
+      )}
+      {resetOpen && (
+        <ResetCharacterModal
+          modeLabel={modeLabel}
+          progress={progress}
+          completedCount={completedCount}
+          builtStations={stations.filter((station) => (progress.hideoutLevels[station.id] ?? 0) > 0).length}
+          onConfirm={performReset}
+          onClose={() => setResetOpen(false)}
+        />
+      )}
+      {toast && (
+        <div className="toast" role="status">
+          <span>{toast.message}</span>
+          {toast.undo && resetSnapshot && <button type="button" onClick={undoReset}>Desfazer</button>}
+          <button type="button" className="toast-close" aria-label="Fechar aviso" onClick={() => setToast(null)}>×</button>
+        </div>
       )}
       {selectedTask && (
         <QuestIntelModal
@@ -914,6 +1119,19 @@ function checkJson(label: string) {
     if (!response.ok) throw new Error(`Falha ao carregar ${label}.`);
     return response.json() as Promise<unknown>;
   };
+}
+
+// A network-level failure (flaky connection, browser cache write errors on the
+// large items payload) gets one retry that bypasses the HTTP cache.
+async function loadDataset(url: string, label: string): Promise<unknown> {
+  try {
+    return await fetch(url).then(checkJson(label));
+  } catch (reason) {
+    if (!(reason instanceof TypeError)) throw reason;
+    return fetch(url, { cache: "no-store" }).then(checkJson(label)).catch((retryReason: unknown) => {
+      throw retryReason instanceof TypeError ? new Error(`Sem conexão ao carregar ${label}. Tente recarregar a página.`) : retryReason;
+    });
+  }
 }
 
 function formatDuration(seconds: number) {
@@ -1126,7 +1344,7 @@ function QuestIntelModal({
         <div className="quest-intel-overview">
           <div className="quest-intel-hero">
             {heroImage ? <img src={heroImage} alt="" referrerPolicy="no-referrer" /> : <div className="quest-intel-hero-placeholder">NO QUEST IMAGE</div>}
-            <div className="quest-intel-hero-strip"><span>{status === "completed" ? "CONCLUÍDA" : status === "chain-ready" ? "CADEIA LIBERADA" : "BLOQUEADA"}</span><b>PMC LV. {task.minPlayerLevel}+</b></div>
+            <div className="quest-intel-hero-strip"><span>{status === "completed" ? "CONCLUÍDA" : status === "chain-ready" ? "CADEIA LIBERADA" : "BLOQUEADA"}</span><b>PMC LV. {task.unlockPlayerLevel}+{task.traderLoyaltyLevel > 1 ? ` · LL${task.traderLoyaltyLevel}` : ""}</b></div>
           </div>
           <div className="quest-intel-data">
             <div className="eyebrow">QUEST DATA</div>
@@ -1135,6 +1353,7 @@ function QuestIntelModal({
               <div><dt>Given by</dt><dd>{trader ? dual(trader.name, trader.nameEn) : task.traderName}</dd></div>
               <div><dt>Experience</dt><dd>{task.experience > 0 ? `+${number.format(task.experience)} XP` : "—"}</dd></div>
               <div><dt>Kappa</dt><dd>{task.kappaRequired ? "Required" : "No"}</dd></div>
+              <div><dt>Faction</dt><dd>{task.factionName === "Any" ? "Any" : task.factionName}</dd></div>
             </dl>
             <div className="quest-intel-relations">
               <div><span>Previous</span>{previous.length ? previous.map((entry) => <button type="button" key={entry.id} onClick={() => onOpenTask(entry)}>{dual(entry.name, entry.nameEn)}</button>) : <em>—</em>}</div>
@@ -1243,6 +1462,89 @@ function QuestIntelModal({
 
 function ProfileField({ label, prefix, value, min = 0, onChange }: { label: string; prefix: string; value: number; min?: number; onChange: (value: number) => void }) {
   return <label className="profile-field"><span>{label}</span><div className="profile-input-wrap"><b>{prefix}</b><input type="number" min={min} step="1" value={value} onChange={(event) => onChange(Number(event.target.value))} /></div></label>;
+}
+
+const RESET_OPTIONS: Array<{ id: keyof ResetScope; label: string; detail: string }> = [
+  { id: "quests", label: "Missões", detail: "desmarca todas as quests concluídas" },
+  { id: "story", label: "Modo história", detail: "desmarca etapas e capítulos da história" },
+  { id: "hideout", label: "Hideout", detail: "todas as estações voltam ao nível 0" },
+  { id: "level", label: "Level do PMC", detail: "volta para o level 1" },
+  { id: "wallet", label: "Carteira", detail: "zera rublos, dólares e euros" },
+  { id: "stash", label: "Itens do stash", detail: "zera as quantidades de itens registradas" },
+  { id: "keys", label: "Chaves", detail: "zera a coleção de chaves registrada" },
+];
+
+function ResetCharacterModal({
+  modeLabel,
+  progress,
+  completedCount,
+  builtStations,
+  onConfirm,
+  onClose,
+}: {
+  modeLabel: string;
+  progress: ProfileProgress;
+  completedCount: number;
+  builtStations: number;
+  onConfirm: (scope: ResetScope, nextPrestigeLevel: number) => void;
+  onClose: () => void;
+}) {
+  const [scope, setScope] = useState<ResetScope>({ quests: true, story: true, hideout: true, level: true, wallet: true, stash: true, keys: true });
+  const [prestiged, setPrestiged] = useState(true);
+  const nextPrestige = prestiged ? Math.min(10, progress.prestigeLevel + 1) : progress.prestigeLevel;
+  const anySelected = Object.values(scope).some(Boolean);
+  const stats: Record<keyof ResetScope, string> = {
+    quests: `${completedCount} concluídas`,
+    story: `${Object.values(progress.storySteps).filter(Boolean).length} etapas marcadas`,
+    hideout: `${builtStations} estações construídas`,
+    level: `level ${progress.playerLevel}`,
+    wallet: currencyAmount("RUB", progress.wallet.RUB),
+    stash: `${Object.values(progress.inventory).filter((amount) => amount > 0).length} tipos registrados`,
+    keys: "coleção de chaves",
+  };
+
+  return (
+    <div className="item-uses-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="reset-modal" role="dialog" aria-modal="true" aria-labelledby="reset-title">
+        <header className="reset-modal-header">
+          <div>
+            <div className="eyebrow">NOVO PERSONAGEM · {modeLabel}</div>
+            <h2 id="reset-title">Resetar personagem</h2>
+            <p>Ideal depois de um prestígio ou wipe. Facção, retrato e chaves marcadas como “manter repetidas” são preservados.</p>
+          </div>
+          <button type="button" className="item-uses-close" onClick={onClose}>FECHAR ×</button>
+        </header>
+
+        <label className={prestiged ? "prestige-toggle active" : "prestige-toggle"}>
+          <input type="checkbox" checked={prestiged} onChange={(event) => setPrestiged(event.target.checked)} />
+          <span className="prestige-toggle-icon">★</span>
+          <span>
+            <b>Fiz prestígio</b>
+            <small>{prestiged ? `Prestígio ${progress.prestigeLevel} → ${nextPrestige}` : `Mantém prestígio ${progress.prestigeLevel}`}</small>
+          </span>
+        </label>
+
+        <div className="reset-options">
+          {RESET_OPTIONS.map((option) => (
+            <label key={option.id} className={scope[option.id] ? "reset-option active" : "reset-option"}>
+              <input type="checkbox" checked={scope[option.id]} onChange={(event) => setScope((current) => ({ ...current, [option.id]: event.target.checked }))} />
+              <span className="reset-check" />
+              <span className="reset-option-copy"><b>{option.label}</b><small>{option.detail}</small></span>
+              <em>{stats[option.id]}</em>
+            </label>
+          ))}
+        </div>
+
+        <footer className="reset-modal-footer">
+          <p>Um snapshot do estado atual é guardado neste navegador — dá para desfazer pelo aviso ou em Perfil.</p>
+          <div>
+            <button type="button" className="ghost-button" onClick={onClose}>Cancelar</button>
+            <button type="button" className="danger-button solid" disabled={!anySelected && !prestiged} onClick={() => onConfirm(scope, nextPrestige)}>↺ Resetar agora</button>
+          </div>
+        </footer>
+      </section>
+    </div>
+  );
 }
 
 function KeepRow({ need, recentlyCovered, onOwned, onInspect }: { need: ItemNeed; recentlyCovered: boolean; onOwned: (amount: number) => void; onInspect: (item: TarkovItem) => void }) {
@@ -1542,18 +1844,40 @@ function QuestBoardKeyRow({ entry, onInspect }: { entry: QuestBoardKey; onInspec
   );
 }
 
+const TRADER_ORDER = [
+  "prapor", "therapist", "fence", "skier", "peacekeeper", "mechanic", "ragman", "jaeger",
+  "ref", "lightkeeper", "btr-driver", "taran", "voevoda", "mr-kerman", "radio-station", "survivor",
+];
+
+function traderRank(trader: TarkovTrader) {
+  const candidates = [trader.normalizedName, trader.nameEn.toLocaleLowerCase()];
+  const index = TRADER_ORDER.findIndex((name) => candidates.some((candidate) => candidate === name || candidate.includes(name)));
+  return index < 0 ? TRADER_ORDER.length : index;
+}
+
+function sortTasks(tasks: TarkovTask[], sort: TaskSortMode) {
+  return [...tasks].sort((a, b) => {
+    if (sort === "name") return a.name.localeCompare(b.name);
+    if (sort === "level") return a.unlockPlayerLevel - b.unlockPlayerLevel || a.gameOrder - b.gameOrder;
+    return a.gameOrder - b.gameOrder;
+  });
+}
+
 function QuestSection({
   view,
   tasks,
   progress,
   itemMap,
   traders,
+  maps,
   traderFilter,
   setTraderFilter,
   query,
   setQuery,
   filter,
   setFilter,
+  sort,
+  setSort,
   onCompleted,
   onCurrent,
   onInspectTask,
@@ -1563,12 +1887,15 @@ function QuestSection({
   progress: ProfileProgress;
   itemMap: Map<string, TarkovItem>;
   traders: TarkovTrader[];
+  maps: TarkovMap[];
   traderFilter: string;
   setTraderFilter: (value: string) => void;
   query: string;
   setQuery: (value: string) => void;
   filter: TaskStatusFilter;
   setFilter: (value: TaskStatusFilter) => void;
+  sort: TaskSortMode;
+  setSort: (value: TaskSortMode) => void;
   onCompleted: (id: string, completed: boolean) => void;
   onCurrent: (id: string) => void;
   onInspectTask: (task: TarkovTask) => void;
@@ -1577,17 +1904,10 @@ function QuestSection({
   const completed = tasks.filter((task) => taskIsCompleted(task, progress)).length;
   const needle = query.trim().toLocaleLowerCase();
   const taskTraderIds = new Set(tasks.map((task) => task.traderId).filter((id): id is string => Boolean(id)));
-  const traderOrder = ["prapor", "therapist", "fence", "skier", "peacekeeper", "mechanic", "ragman", "jaeger", "ref", "lightkeeper"];
   const relevantTraders = traders
     .filter((trader) => taskTraderIds.has(trader.id))
-    .sort((a, b) => {
-      const aName = a.nameEn.toLocaleLowerCase();
-      const bName = b.nameEn.toLocaleLowerCase();
-      const ai = traderOrder.findIndex((name) => aName.includes(name));
-      const bi = traderOrder.findIndex((name) => bName.includes(name));
-      if (ai >= 0 || bi >= 0) return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
-      return a.name.localeCompare(b.name);
-    });
+    .sort((a, b) => traderRank(a) - traderRank(b) || a.name.localeCompare(b.name));
+  const mapById = new Map(maps.map((map) => [map.id, map]));
 
   const taskPassesText = (task: TarkovTask) => {
     if (!needle) return true;
@@ -1595,10 +1915,13 @@ function QuestSection({
       const item = itemMap.get(id);
       return item ? [item.name, item.nameEn, item.shortName, item.shortNameEn] : [];
     }));
-    return searchText(task.name, task.nameEn, task.traderName, task.traderNameEn, ...keyNames).includes(needle);
+    const map = task.mapId ? mapById.get(task.mapId) : undefined;
+    return searchText(task.name, task.nameEn, task.traderName, task.traderNameEn, map?.name, map?.nameEn, ...keyNames).includes(needle);
   };
 
   const taskMap = new Map(tasks.map((task) => [task.id, task]));
+  const isAvailableNow = (task: TarkovTask) =>
+    taskChainState(task, progress) === "chain-ready" && progress.playerLevel >= task.unlockPlayerLevel;
 
   // The status counters must describe the same scope the user is viewing.
   // Trader + text search narrow the scope first; the status tab is applied afterwards.
@@ -1610,13 +1933,16 @@ function QuestSection({
   const chainCounts = scopedTasks.reduce((acc, task) => {
     const state = taskChainState(task, progress);
     if (state === "completed") acc.completed += 1;
-    else if (state === "chain-ready") acc.ready += 1;
-    else acc.blocked += 1;
+    else if (state === "chain-ready") {
+      acc.ready += 1;
+      if (isAvailableNow(task)) acc.available += 1;
+    } else acc.blocked += 1;
     return acc;
-  }, { ready: 0, blocked: 0, completed: 0 });
+  }, { available: 0, ready: 0, blocked: 0, completed: 0 });
 
   const filtered = scopedTasks.filter((task) => {
     const chainState = taskChainState(task, progress);
+    if (filter === "available" && !isAvailableNow(task)) return false;
     if (filter === "chain-ready" && chainState !== "chain-ready") return false;
     if (filter === "blocked" && chainState !== "blocked-by-task") return false;
     if (filter === "completed" && chainState !== "completed") return false;
@@ -1632,45 +1958,63 @@ function QuestSection({
   }));
 
   const groups = relevantTraders.flatMap((trader) => {
-    const groupTasks = filtered
-      .filter((task) => task.traderId === trader.id)
-      .sort((a, b) => a.minPlayerLevel - b.minPlayerLevel || a.name.localeCompare(b.name));
+    const groupTasks = sortTasks(filtered.filter((task) => task.traderId === trader.id), sort);
     if (!groupTasks.length) return [];
     return [{ trader, tasks: groupTasks }];
   });
-  const ungrouped = filtered.filter((task) => !task.traderId || !relevantTraders.some((trader) => trader.id === task.traderId));
+  const ungrouped = sortTasks(filtered.filter((task) => !task.traderId || !relevantTraders.some((trader) => trader.id === task.traderId)), sort);
+  const hiddenFactionHint = !progress.faction && tasks.some((task) => task.factionName !== "Any");
 
+  const rowProps = { progress, itemMap, taskMap, mapById, showOrder: sort === "game", onCompleted, onCurrent, onInspect: onInspectTask };
 
   return (
     <section>
       <div className="section-heading">
-        <div><div className="eyebrow">QUEST PROGRESS</div><h2>{title}</h2><p>{completed}/{tasks.length} concluídas. “Cadeia liberada” significa que não falta nenhuma quest pré-requisito conhecida; level, loyalty e outros gates do jogo ainda podem se aplicar. A busca aceita PT/EN, trader e chaves.</p></div>
-        <input className="search" placeholder="Quest, trader ou chave, PT/EN…" value={query} onChange={(event) => setQuery(event.target.value)} />
+        <div>
+          <div className="eyebrow">QUEST PROGRESS</div>
+          <h2>{title}</h2>
+          <p>{completed}/{tasks.length} concluídas. “Disponível agora” = nenhuma quest pré-requisito pendente e seu level atende o requisito (inclusive o level do LL do trader). Reputação e contadores ocultos de história do jogo ainda podem segurar algumas.</p>
+        </div>
+        <input className="search" placeholder="Quest, trader, mapa ou chave…" value={query} onChange={(event) => setQuery(event.target.value)} />
       </div>
+
+      {hiddenFactionHint && <div className="inline-hint">Defina sua facção (BEAR/USEC) em <b>Perfil</b> para esconder as missões exclusivas da outra facção.</div>}
 
       <div className="trader-filter-grid">
         <button type="button" className={traderFilter === "all" ? "trader-filter-card active" : "trader-filter-card"} onClick={() => setTraderFilter("all")}>
           <div className="trader-avatar trader-avatar-all">ALL</div>
-          <div className="trader-filter-copy"><strong>Todos os traders</strong><span>{completed}/{tasks.length} concluídas</span></div>
+          <div className="trader-filter-copy"><strong>Todos</strong><span>{completed}/{tasks.length}</span></div>
         </button>
         {relevantTraders.map((trader) => {
           const stats = traderStats.get(trader.id) ?? { total: 0, completed: 0 };
+          const percent = stats.total ? Math.round((stats.completed / stats.total) * 100) : 0;
           return (
-            <button type="button" key={trader.id} className={traderFilter === trader.id ? "trader-filter-card active" : "trader-filter-card"} onClick={() => setTraderFilter(trader.id)}>
+            <button type="button" key={trader.id} className={traderFilter === trader.id ? "trader-filter-card active" : "trader-filter-card"} onClick={() => setTraderFilter(trader.id)} title={dual(trader.name, trader.nameEn)}>
               <TraderAvatar trader={trader} />
-              <div className="trader-filter-copy"><strong>{dual(trader.name, trader.nameEn)}</strong><span>{stats.completed}/{stats.total} concluídas</span></div>
+              <div className="trader-filter-copy"><strong>{trader.name}</strong><span>{stats.completed}/{stats.total}</span></div>
+              <i className="trader-filter-progress" style={{ width: `${percent}%` }} />
             </button>
           );
         })}
       </div>
 
-      <div className="subtabs quest-status-tabs">
-        {([
-          ["all", `Todas · ${scopedTasks.length}`],
-          ["chain-ready", `Cadeia liberada · ${chainCounts.ready}`],
-          ["blocked", `Bloqueadas por missão · ${chainCounts.blocked}`],
-          ["completed", `Concluídas · ${chainCounts.completed}`],
-        ] as Array<[TaskStatusFilter, string]>).map(([id, label]) => <button key={id} className={filter === id ? "subtab active" : "subtab"} onClick={() => setFilter(id)}>{label}</button>)}
+      <div className="quest-toolbar">
+        <div className="subtabs quest-status-tabs">
+          {([
+            ["all", "Todas", scopedTasks.length],
+            ["available", "Disponíveis agora", chainCounts.available],
+            ["chain-ready", "Cadeia liberada", chainCounts.ready],
+            ["blocked", "Bloqueadas", chainCounts.blocked],
+            ["completed", "Concluídas", chainCounts.completed],
+          ] as Array<[TaskStatusFilter, string, number]>).map(([id, label, count]) => (
+            <button key={id} type="button" className={filter === id ? "subtab active" : "subtab"} onClick={() => setFilter(id)}>{label}<b>{count}</b></button>
+          ))}
+        </div>
+        <div className="segmented sort-switch" role="group" aria-label="Ordenação">
+          {([["game", "Ordem do jogo"], ["level", "Level"], ["name", "A–Z"]] as Array<[TaskSortMode, string]>).map(([id, label]) => (
+            <button key={id} type="button" className={sort === id ? "active" : ""} onClick={() => setSort(id)}>{label}</button>
+          ))}
+        </div>
       </div>
 
       <div className="quest-groups">
@@ -1680,13 +2024,11 @@ function QuestSection({
             <section className="quest-trader-group" key={trader.id}>
               <div className="quest-trader-header">
                 <TraderAvatar trader={trader} large />
-                <div><div className="eyebrow">TRADER</div><h3>{dual(trader.name, trader.nameEn)}</h3><span>{stats.completed}/{stats.total} concluídas · {groupTasks.length} visíveis neste filtro</span></div>
+                <div><div className="eyebrow">TRADER</div><h3>{dual(trader.name, trader.nameEn)}</h3><span>{stats.completed}/{stats.total} concluídas · {groupTasks.length} neste filtro</span></div>
                 <div className="trader-progress"><i style={{ width: `${stats.total ? Math.round((stats.completed / stats.total) * 100) : 0}%` }} /></div>
               </div>
-              <div className="quest-list quest-list-flat">
-                {groupTasks.map((task) => (
-                  <QuestRow key={task.id} task={task} progress={progress} itemMap={itemMap} taskMap={taskMap} onCompleted={onCompleted} onCurrent={onCurrent} onInspect={onInspectTask} />
-                ))}
+              <div className="quest-list">
+                {groupTasks.map((task) => <QuestRow key={task.id} task={task} {...rowProps} />)}
               </div>
             </section>
           );
@@ -1694,10 +2036,10 @@ function QuestSection({
         {ungrouped.length > 0 && (
           <section className="quest-trader-group">
             <div className="quest-trader-header"><div className="trader-avatar trader-avatar-large trader-avatar-all">?</div><div><div className="eyebrow">OUTROS</div><h3>Trader não identificado</h3><span>{ungrouped.length} missões visíveis</span></div></div>
-            <div className="quest-list">{ungrouped.slice().sort((a, b) => a.minPlayerLevel - b.minPlayerLevel || a.name.localeCompare(b.name)).map((task) => <QuestRow key={task.id} task={task} progress={progress} itemMap={itemMap} taskMap={taskMap} onCompleted={onCompleted} onCurrent={onCurrent} onInspect={onInspectTask} />)}</div>
+            <div className="quest-list">{ungrouped.map((task) => <QuestRow key={task.id} task={task} {...rowProps} />)}</div>
           </section>
         )}
-        {!filtered.length && <div className="empty">Nenhuma missão encontrada.</div>}
+        {!filtered.length && <div className="empty">Nenhuma missão encontrada neste filtro.</div>}
       </div>
     </section>
   );
@@ -1712,22 +2054,34 @@ function TraderAvatar({ trader, large = false }: { trader: TarkovTrader; large?:
   );
 }
 
-function QuestRow({ task, progress, itemMap, taskMap, onCompleted, onCurrent, onInspect }: { task: TarkovTask; progress: ProfileProgress; itemMap: Map<string, TarkovItem>; taskMap: Map<string, TarkovTask>; onCompleted: (id: string, completed: boolean) => void; onCurrent: (id: string) => void; onInspect: (task: TarkovTask) => void }) {
+function QuestRow({ task, progress, itemMap, taskMap, mapById, showOrder, onCompleted, onCurrent, onInspect }: { task: TarkovTask; progress: ProfileProgress; itemMap: Map<string, TarkovItem>; taskMap: Map<string, TarkovTask>; mapById: Map<string, TarkovMap>; showOrder: boolean; onCompleted: (id: string, completed: boolean) => void; onCurrent: (id: string) => void; onInspect: (task: TarkovTask) => void }) {
   const chainState = taskChainState(task, progress);
   const missingIds = missingTaskRequirements(task, progress);
   const missingTasks = missingIds.map((id) => taskMap.get(id)).filter((candidate): candidate is TarkovTask => Boolean(candidate));
-  const levelMet = progress.playerLevel >= task.minPlayerLevel;
-  const statusLabel = chainState === "completed" ? "Concluída" : chainState === "chain-ready" ? "Cadeia liberada" : "Bloqueada por missão";
+  const levelMet = progress.playerLevel >= task.unlockPlayerLevel;
+  const availableNow = chainState === "chain-ready" && levelMet;
+  const rowState = availableNow ? "available" : chainState;
+  const statusLabel = chainState === "completed" ? "Concluída" : availableNow ? "Disponível" : chainState === "chain-ready" ? "Level insuficiente" : "Bloqueada";
+  const map = task.mapId ? mapById.get(task.mapId) : undefined;
   return (
-    <article className={`quest-row ${chainState} quest-row-clickable`} onClick={() => onInspect(task)}>
-      <label className="quest-check" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={taskIsCompleted(task, progress)} onChange={(event) => onCompleted(task.id, event.target.checked)} /><span /></label>
+    <article className={`quest-row ${rowState}`} onClick={() => onInspect(task)}>
+      <label className="quest-check" onClick={(event) => event.stopPropagation()} title={chainState === "completed" ? "Desmarcar" : "Marcar como concluída"}>
+        <input type="checkbox" checked={taskIsCompleted(task, progress)} onChange={(event) => onCompleted(task.id, event.target.checked)} />
+        <span />
+      </label>
       <div className="quest-main">
-        <div className="quest-title"><strong>{dual(task.name, task.nameEn)}</strong></div>
+        <div className="quest-title">
+          {showOrder && <span className="quest-order">{task.gameOrder + 1}</span>}
+          <strong>{dual(task.name, task.nameEn)}</strong>
+        </div>
         <div className="quest-meta">
-          <span className={`status-pill ${chainState}`}>{statusLabel}</span>
-          <span className={levelMet ? "level-met" : "level-missing"}>PMC Lv. {task.minPlayerLevel}+{levelMet ? " ✓" : " necessário"}</span>
+          <span className={`status-pill ${rowState}`}>{statusLabel}</span>
+          {task.unlockPlayerLevel > 1 && <span className={levelMet ? "level-met" : "level-missing"}>Lv. {task.unlockPlayerLevel}+</span>}
+          {task.traderLoyaltyLevel > 1 && <span className="ll-pill">LL{task.traderLoyaltyLevel}</span>}
+          {map && <span className="map-pill">🗺 {map.name}</span>}
+          {task.factionName !== "Any" && <span className={`faction-pill ${task.factionName.toLowerCase()}`}>{task.factionName}</span>}
           {task.kappaRequired && <span className="kappa-pill">Kappa</span>}
-          {task.lightkeeperRequired && <span>Lightkeeper</span>}
+          {task.lightkeeperRequired && <span className="lk-pill">Lightkeeper</span>}
         </div>
         {chainState === "blocked-by-task" && (
           <div className="quest-dependency-line">
@@ -1737,22 +2091,213 @@ function QuestRow({ task, progress, itemMap, taskMap, onCompleted, onCurrent, on
             {missingIds.length > 4 && <em>+{missingIds.length - 4}</em>}
           </div>
         )}
-        {chainState === "chain-ready" && !levelMet && <div className="quest-caveat">A cadeia de quests está liberada, mas seu level de PMC ainda não atende este requisito.</div>}
-        {(task.itemRequirements.length > 0 || task.keyRequirements.length > 0) && <div className="quest-items">
+        {(task.itemRequirements.length > 0 || task.keyRequirements.length > 0) && chainState !== "completed" && <div className="quest-items">
           {task.itemRequirements.slice(0, 6).map((requirement, index) => {
             const names = requirement.itemIds.map((id) => itemMap.get(id)).filter((item): item is TarkovItem => Boolean(item)).map((item) => dual(item.shortName, item.shortNameEn));
             const requirementKey = ["item", task.id, requirement.objectiveId, requirement.itemIds.join("-"), requirement.count, requirement.foundInRaid ? "fir" : "any", index].join(":");
-            return <span key={requirementKey}>{requirement.count}× {names.length ? names.join(" / ") : "item"}{requirement.itemIds.length > 1 ? " (alternativas)" : ""}{requirement.foundInRaid ? " · FIR" : ""}</span>;
+            const shown = names.length > 3 ? `${names.slice(0, 3).join(" / ")} +${names.length - 3}` : names.join(" / ");
+            return <span key={requirementKey} className={requirement.foundInRaid ? "fir" : ""}>{requirement.count}× {shown || "item"}{requirement.foundInRaid ? " · FIR" : ""}</span>;
           })}
           {task.keyRequirements.slice(0, 5).map((requirement, index) => {
             const names = requirement.keyIds.map((id) => itemMap.get(id)).filter((item): item is TarkovItem => Boolean(item)).map((item) => dual(item.shortName, item.shortNameEn));
             const requirementKey = ["key", task.id, requirement.objectiveId, requirement.keyIds.join("-"), index].join(":");
-            return <span className="key-requirement-chip" key={requirementKey}>🔑 {names.length ? names.join(" / ") : "chave"}{requirement.keyIds.length > 1 ? " · 1 alternativa" : ""}</span>;
+            return <span className="key-requirement-chip" key={requirementKey}>🔑 {names.length ? names.join(" / ") : "chave"}{requirement.keyIds.length > 1 ? " · alternativas" : ""}</span>;
           })}
         </div>}
       </div>
-      <button className="current-task" type="button" disabled={chainState === "completed"} onClick={(event) => { event.stopPropagation(); onCurrent(task.id); }}>Estou nesta</button>
+      <button className="current-task" type="button" disabled={chainState === "completed"} title="Marca todos os pré-requisitos como concluídos" onClick={(event) => { event.stopPropagation(); onCurrent(task.id); }}>Estou nesta</button>
     </article>
   );
 }
 
+type StoryFilter = "all" | "progress" | "todo" | "done";
+
+function storyChapterState(chapter: StoryChapter, progress: ProfileProgress) {
+  if (progress.storyChapters[chapter.id]) return "done" as const;
+  return chapter.steps.some((step) => progress.storySteps[step.id]) ? "progress" as const : "todo" as const;
+}
+
+function StorySection({
+  story,
+  loading,
+  error,
+  progress,
+  onRetry,
+  onStep,
+  onChapterDone,
+  onClearChapter,
+}: {
+  story: StoryData | null;
+  loading: boolean;
+  error: string | null;
+  progress: ProfileProgress;
+  onRetry: () => void;
+  onStep: (stepId: string, done: boolean) => void;
+  onChapterDone: (chapter: StoryChapter, done: boolean) => void;
+  onClearChapter: (chapter: StoryChapter) => void;
+}) {
+  const [filter, setFilter] = useState<StoryFilter>("all");
+  const [hideDone, setHideDone] = useState(false);
+  const [openIds, setOpenIds] = useState<Set<string> | null>(null);
+  const chapters = story?.chapters ?? [];
+
+  // Open the first unfinished chapter by default.
+  const open = openIds ?? new Set(chapters.filter((chapter) => storyChapterState(chapter, progress) !== "done").slice(0, 1).map((chapter) => chapter.id));
+  const toggle = (id: string) => {
+    const next = new Set(open);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    setOpenIds(next);
+  };
+
+  const counts = chapters.reduce((acc, chapter) => {
+    acc[storyChapterState(chapter, progress)] += 1;
+    return acc;
+  }, { done: 0, progress: 0, todo: 0 });
+  const visible = chapters.filter((chapter) => filter === "all" || storyChapterState(chapter, progress) === filter);
+
+  return (
+    <section>
+      <div className="section-heading">
+        <div>
+          <div className="eyebrow">STORY MODE</div>
+          <h2>Modo história</h2>
+          <p>Capítulos da história com todas as etapas, inclusive os caminhos de cada escolha e final. <b>Tour</b> abre a história e <b>The Ticket</b> é o capítulo final; os demais começam quando você acha o item ou local que os ativa e podem correr em paralelo. Dados da Wiki oficial (em inglês) — o tarkov.dev ainda não publica a história na API.</p>
+        </div>
+        {story && <a className="ghost-button story-wiki-link" href="https://escapefromtarkov.fandom.com/wiki/Story_chapters" target="_blank" rel="noreferrer">Story chapters na Wiki ↗</a>}
+      </div>
+
+      {loading && <div className="loading-panel"><span className="spinner" /> Lendo os capítulos da Wiki…</div>}
+      {error && !loading && <div className="error-banner story-error"><span>{error}</span><button type="button" className="ghost-button" onClick={onRetry}>Tentar de novo</button></div>}
+
+      {story && !loading && (
+        <>
+          <div className="quest-toolbar">
+            <div className="subtabs">
+              {([
+                ["all", "Todos", chapters.length],
+                ["progress", "Em andamento", counts.progress],
+                ["todo", "Não iniciados", counts.todo],
+                ["done", "Concluídos", counts.done],
+              ] as Array<[StoryFilter, string, number]>).map(([id, label, count]) => (
+                <button key={id} type="button" className={filter === id ? "subtab active" : "subtab"} onClick={() => setFilter(id)}>{label}<b>{count}</b></button>
+              ))}
+            </div>
+            <label className="toggle-chip">
+              <input type="checkbox" checked={hideDone} onChange={(event) => setHideDone(event.target.checked)} />
+              <span>Ocultar etapas feitas</span>
+            </label>
+          </div>
+
+          <div className="story-list">
+            {visible.map((chapter) => (
+              <StoryChapterCard
+                key={chapter.id}
+                chapter={chapter}
+                progress={progress}
+                open={open.has(chapter.id)}
+                hideDone={hideDone}
+                onToggle={() => toggle(chapter.id)}
+                onStep={onStep}
+                onChapterDone={onChapterDone}
+                onClearChapter={onClearChapter}
+              />
+            ))}
+            {!visible.length && <div className="empty">Nenhum capítulo neste filtro.</div>}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+function StoryChapterCard({
+  chapter,
+  progress,
+  open,
+  hideDone,
+  onToggle,
+  onStep,
+  onChapterDone,
+  onClearChapter,
+}: {
+  chapter: StoryChapter;
+  progress: ProfileProgress;
+  open: boolean;
+  hideDone: boolean;
+  onToggle: () => void;
+  onStep: (stepId: string, done: boolean) => void;
+  onChapterDone: (chapter: StoryChapter, done: boolean) => void;
+  onClearChapter: (chapter: StoryChapter) => void;
+}) {
+  const state = storyChapterState(chapter, progress);
+  const stats = storyChapterProgress(chapter, progress.storySteps);
+  const percent = state === "done" ? 100 : stats.total ? Math.round((stats.completed / stats.total) * 100) : 0;
+  const stateLabel = state === "done" ? "Concluído" : state === "progress" ? "Em andamento" : "Não iniciado";
+  const steps = hideDone ? chapter.steps.filter((step) => !progress.storySteps[step.id]) : chapter.steps;
+
+  return (
+    <article className={`story-chapter ${state}${open ? " open" : ""}`}>
+      <button type="button" className="story-chapter-head" onClick={onToggle} aria-expanded={open}>
+        {chapter.bannerUrl && <img className="story-banner" src={chapter.bannerUrl} alt="" referrerPolicy="no-referrer" onError={(event) => { event.currentTarget.style.display = "none"; }} />}
+        <div className="story-icon">
+          {chapter.iconUrl ? <img src={chapter.iconUrl} alt="" referrerPolicy="no-referrer" onError={(event) => { event.currentTarget.style.display = "none"; }} /> : null}
+        </div>
+        <div className="story-head-copy">
+          <span className={`story-state ${state}`}>{stateLabel}</span>
+          <h3>{chapter.title}</h3>
+          <div className="story-progress"><i style={{ width: `${percent}%` }} /></div>
+          <small>{stats.completed}/{stats.total} etapas obrigatórias{chapter.steps.length > stats.total ? ` · ${chapter.steps.length - stats.total} opcionais` : ""}</small>
+        </div>
+        <span className="story-chevron" aria-hidden="true">{open ? "▾" : "▸"}</span>
+      </button>
+
+      {open && (
+        <div className="story-body">
+          {chapter.description && <blockquote className="story-quote">{chapter.description}</blockquote>}
+
+          {chapter.requirements.length > 0 && (
+            <div className="story-requirements">
+              <div className="eyebrow">COMO COMEÇAR</div>
+              {chapter.requirements.map((line, index) => <p key={index}>{line}</p>)}
+            </div>
+          )}
+
+          <div className="story-steps">
+            {steps.map((step, index) => {
+              const showBranch = step.branch !== (steps[index - 1]?.branch ?? null);
+              const done = Boolean(progress.storySteps[step.id]);
+              return (
+                <div key={step.id} className="story-step-wrap">
+                  {showBranch && (step.branch ? <div className="story-branch">⑂ {step.branch}</div> : <div className="story-branch main">Linha principal</div>)}
+                  <label className={`story-step${done ? " done" : ""}${step.optional ? " optional" : ""}`}>
+                    <input type="checkbox" checked={done} onChange={(event) => onStep(step.id, event.target.checked)} />
+                    <span className="story-check" />
+                    <span className="story-step-text">{step.text}</span>
+                    {step.optional && <em>Opcional</em>}
+                  </label>
+                </div>
+              );
+            })}
+            {!steps.length && <div className="quest-intel-empty">Todas as etapas deste capítulo estão marcadas.</div>}
+          </div>
+
+          {chapter.rewards.length > 0 && (
+            <details className="story-rewards">
+              <summary>Recompensas ({chapter.rewards.length})</summary>
+              {chapter.rewards.map((line, index) => <p key={index}>{line}</p>)}
+            </details>
+          )}
+
+          <div className="story-actions">
+            <button type="button" className={state === "done" ? "ghost-button" : "backup-button primary"} onClick={() => onChapterDone(chapter, state !== "done")}>
+              {state === "done" ? "Reabrir capítulo" : "✓ Marcar capítulo como concluído"}
+            </button>
+            <a className="ghost-button" href={chapter.wikiUrl} target="_blank" rel="noreferrer">Guia completo na Wiki ↗</a>
+            <a className="ghost-button" href={`https://www.youtube.com/results?search_query=${encodeURIComponent(`${chapter.title} tarkov story chapter`)}`} target="_blank" rel="noreferrer">YouTube ↗</a>
+            {state !== "todo" && <button type="button" className="link-button story-clear" onClick={() => onClearChapter(chapter)}>Limpar progresso do capítulo</button>}
+          </div>
+        </div>
+      )}
+    </article>
+  );
+}

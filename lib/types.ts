@@ -103,11 +103,19 @@ export type ItemUsesData = {
   crafts: ItemCraftUse[];
 };
 
+export type TraderLoyaltyLevel = {
+  level: number;
+  requiredPlayerLevel: number;
+  requiredReputation: number;
+};
+
 export type TarkovTrader = {
   id: string;
   name: string;
   nameEn: string;
+  normalizedName: string;
   imageLink: string | null;
+  levels: TraderLoyaltyLevel[];
 };
 
 export type HideoutItemRequirement = {
@@ -184,6 +192,9 @@ export type QuestWikiData = {
   sections: string[];
 };
 
+export type Faction = "BEAR" | "USEC";
+export type TaskFaction = Faction | "Any";
+
 export type TarkovTask = {
   id: string;
   name: string;
@@ -196,6 +207,20 @@ export type TarkovTask = {
   minPlayerLevel: number;
   kappaRequired: boolean;
   lightkeeperRequired: boolean;
+  /** BEAR/USEC-only quests exist; "Any" is shown to every PMC. */
+  factionName: TaskFaction;
+  /**
+   * Position in progression order: prerequisites always come first, then the
+   * earliest player level at which the quest (and its trader LL) unlocks.
+   */
+  gameOrder: number;
+  /**
+   * Highest hidden progression-counter threshold (`otherRequirements` of type
+   * globalVariable) that unlocks this quest. Bigger means later in the story.
+   */
+  progressionGate: number;
+  /** Player level needed to reach `traderLoyaltyLevel` with the quest giver. */
+  unlockPlayerLevel: number;
   wikiLink: string | null;
   taskImageLink: string | null;
   mapId: string | null;
@@ -237,6 +262,12 @@ export type ProfileProgress = {
   completedTasks: Record<string, boolean>;
   preferredDuplicateKeys: Record<string, boolean>;
   avatarPreset?: AvatarPreset;
+  faction: Faction | null;
+  prestigeLevel: number;
+  /** Story-mode step ids (see lib/story.ts) marked as done. */
+  storySteps: Record<string, boolean>;
+  /** Story chapters marked as finished as a whole. */
+  storyChapters: Record<string, boolean>;
 };
 
 export type NeedSource = {
@@ -283,4 +314,5 @@ export type KeyInfo = {
 };
 
 export type KeepFilter = "all" | "hideout" | "quests" | "kappa";
-export type TaskStatusFilter = "all" | "chain-ready" | "blocked" | "completed";
+export type TaskStatusFilter = "all" | "available" | "chain-ready" | "blocked" | "completed";
+export type TaskSortMode = "game" | "level" | "name";

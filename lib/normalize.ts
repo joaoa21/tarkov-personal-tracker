@@ -12,6 +12,8 @@ import type {
   TaskObjectiveSummary,
   TaskRewardItem,
   TaskTraderStandingReward,
+  TaskFaction,
+  TraderLoyaltyLevel,
   VendorPrice,
 } from "./types";
 
@@ -136,11 +138,22 @@ export function normalizeTraders(payload: unknown): TarkovTrader[] {
     const id = asId(raw.id ?? raw._id);
     if (!id) return [];
     const name = localized(raw, "name", id);
+    const levels = toRecordArray(raw.levels).flatMap((level): TraderLoyaltyLevel[] => {
+      const value = asNumber(level.level, 0);
+      if (value < 1) return [];
+      return [{
+        level: value,
+        requiredPlayerLevel: Math.max(0, asNumber(level.requiredPlayerLevel, 0)),
+        requiredReputation: asNumber(level.requiredReputation, 0),
+      }];
+    }).sort((a, b) => a.level - b.level);
     return [{
       id,
       name: name.primary,
       nameEn: name.english,
+      normalizedName: asString(raw.normalizedName),
       imageLink: asString(raw.imageLink) || null,
+      levels,
     }];
   });
 }
@@ -498,6 +511,33 @@ function normalizeTaskKeyRequirements(raw: unknown): TaskKeyRequirement[] {
 }
 
 
+/** Task-level `neededKeys`: [{ map, keys: [id, ...] }] — each entry is an OR-group. */
+function normalizeNeededKeys(raw: AnyRecord): TaskKeyRequirement[] {
+  return toRecordArray(raw.neededKeys).flatMap((entry, index): TaskKeyRequirement[] => {
+    const keyIds = [...new Set(toUnknownArray(entry.keys).map(asId).filter(Boolean))];
+    if (!keyIds.length) return [];
+    return [{
+      keyIds,
+      objectiveId: `needed-keys-${index}`,
+      description: "Chave necessária",
+      descriptionEn: "Required key",
+      optional: false,
+    }];
+  });
+}
+
+function normalizeProgressionGate(raw: AnyRecord): number {
+  return toRecordArray(raw.otherRequirements).reduce((max, requirement) => {
+    if (normalizeRequirementKind(requirement.type) !== "globalvariable") return max;
+    return Math.max(max, asNumber(requirement.value, 0));
+  }, 0);
+}
+
+function normalizeTaskFaction(value: unknown): TaskFaction {
+  const faction = asString(value).toUpperCase();
+  return faction === "BEAR" || faction === "USEC" ? faction : "Any";
+}
+
 function normalizeTaskObjectiveSummary(raw: unknown): TaskObjectiveSummary | null {
   if (!isRecord(raw)) return null;
   const id = asId(raw.id) || asString(raw.type) || "objective";
@@ -631,6 +671,8 @@ function mergeDuplicateTasks(a: TarkovTask, b: TarkovTask): TarkovTask {
     kappaRequired: a.kappaRequired || b.kappaRequired,
     lightkeeperRequired: a.lightkeeperRequired || b.lightkeeperRequired,
     minPlayerLevel: Math.max(a.minPlayerLevel, b.minPlayerLevel),
+    unlockPlayerLevel: Math.max(a.unlockPlayerLevel, b.unlockPlayerLevel),
+    progressionGate: Math.max(a.progressionGate, b.progressionGate),
     traderLoyaltyLevel: Math.max(a.traderLoyaltyLevel, b.traderLoyaltyLevel),
     wikiLink: preferred.wikiLink ?? other.wikiLink,
     taskImageLink: preferred.taskImageLink ?? other.taskImageLink,
@@ -666,6 +708,9 @@ export function normalizeTasks(payload: unknown, traders: TarkovTrader[] = []): 
     }
 
     const objectives = findCollection(raw, ["objectives"]);
+    const traderLoyaltyLevel = normalizeTaskLoyaltyLevel(raw, traderId);
+    const minPlayerLevel = Math.max(1, asNumber(raw.minPlayerLevel, 1));
+    const loyaltyPlayerLevel = trader?.levels.find((level) => level.level === traderLoyaltyLevel)?.requiredPlayerLevel ?? 0;
 
     return [{
       id,
@@ -674,10 +719,14 @@ export function normalizeTasks(payload: unknown, traders: TarkovTrader[] = []): 
       traderId,
       traderName: trader?.name || rawTraderName || traderId || "—",
       traderNameEn: trader?.nameEn || rawTraderNameEn || trader?.name || rawTraderName || traderId || "—",
-      traderLoyaltyLevel: normalizeTaskLoyaltyLevel(raw, traderId),
-      minPlayerLevel: Math.max(1, asNumber(raw.minPlayerLevel, 1)),
+      traderLoyaltyLevel,
+      minPlayerLevel,
+      unlockPlayerLevel: Math.max(minPlayerLevel, loyaltyPlayerLevel),
       kappaRequired: asBoolean(raw.kappaRequired),
       lightkeeperRequired: asBoolean(raw.lightkeeperRequired),
+      factionName: normalizeTaskFaction(raw.factionName),
+      gameOrder: 0,
+      progressionGate: normalizeProgressionGate(raw),
       wikiLink: asString(raw.wikiLink) || null,
       taskImageLink: asString(raw.taskImageLink) || null,
       mapId: asId(raw.map) || null,
@@ -695,19 +744,23 @@ export function normalizeTasks(payload: unknown, traders: TarkovTrader[] = []): 
           .map(normalizeTaskItemRequirement)
           .filter((entry): entry is TaskItemRequirement => entry !== null),
       ),
-      keyRequirements: objectives.flatMap(normalizeTaskKeyRequirements),
+      keyRequirements: dedupeTaskKeyRequirements([
+        ...objectives.flatMap(normalizeTaskKeyRequirements),
+        ...normalizeNeededKeys(raw),
+      ]),
       aliasIds: [],
     }];
   });
 
   // Upstream can temporarily contain legacy/current ids for the same visible
-  // quest after patches. Merge only when both the quest giver and the English
-  // display name are identical, so genuinely different tasks are not hidden.
+  // quest after patches. Merge only when the quest giver, the English display
+  // name and the faction are identical: BEAR/USEC variants such as "Drip-Out"
+  // share a name but are different quests.
   const byIdentity = new Map<string, TarkovTask>();
   for (const task of normalized) {
     const traderIdentity = task.traderId || normalizeTaskIdentityPart(task.traderNameEn || task.traderName);
     const nameIdentity = normalizeTaskIdentityPart(task.nameEn || task.name);
-    const signature = `${traderIdentity}|${nameIdentity}`;
+    const signature = `${traderIdentity}|${nameIdentity}|${task.factionName}`;
     const existing = byIdentity.get(signature);
     byIdentity.set(signature, existing ? mergeDuplicateTasks(existing, task) : task);
   }
@@ -721,13 +774,138 @@ export function normalizeTasks(payload: unknown, traders: TarkovTrader[] = []): 
 
   // Rewrite dependency edges that point at a merged legacy id to the canonical
   // task id, then collapse any duplicated edges created by that rewrite.
-  return deduped.map((task) => ({
+  const canonical = deduped.map((task) => ({
     ...task,
     taskRequirements: dedupeTaskRequirements(task.taskRequirements.map((requirement) => ({
       ...requirement,
       taskId: aliasToCanonical.get(requirement.taskId) ?? requirement.taskId,
     }))),
   }));
+  return assignGameOrder(canonical);
+}
+
+/**
+ * Orders each trader's quests the way they open up in game. A quest never
+ * appears before a prerequisite from the same trader. Among the quests that are
+ * open at the same point, the one reachable earliest comes first: lowest
+ * player level (including what the trader LL demands), then LL, then the
+ * hidden story-counter threshold, then how many quests (from any trader) must
+ * be done first. Remaining ties continue the chain that was placed most
+ * recently, then favour quests that open up longer chains.
+ *
+ * `gameOrder` is the position inside the quest giver's list.
+ */
+function assignGameOrder(tasks: TarkovTask[]): TarkovTask[] {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const prerequisiteIds = (task: TarkovTask) => [...new Set(
+    task.taskRequirements.map((requirement) => requirement.taskId).filter((id) => id !== task.id && byId.has(id)),
+  )];
+
+  // Chain-aware maxima: a level-1 quest behind a level-20 quest (from any
+  // trader) is effectively a level-20 quest.
+  const chainMax = (read: (task: TarkovTask) => number) => {
+    const cache = new Map<string, number>();
+    const visiting = new Set<string>();
+    const resolve = (id: string): number => {
+      const cached = cache.get(id);
+      if (cached !== undefined) return cached;
+      const task = byId.get(id);
+      if (!task || visiting.has(id)) return 0;
+      visiting.add(id);
+      const value = prerequisiteIds(task).reduce((max, parentId) => Math.max(max, resolve(parentId)), read(task));
+      visiting.delete(id);
+      cache.set(id, value);
+      return value;
+    };
+    return resolve;
+  };
+  const levelOf = chainMax((task) => task.unlockPlayerLevel);
+  const gateOf = chainMax((task) => task.progressionGate);
+  const depthCache = new Map<string, number>();
+  const depthOf = (id: string, trail = new Set<string>()): number => {
+    const cached = depthCache.get(id);
+    if (cached !== undefined) return cached;
+    const task = byId.get(id);
+    if (!task || trail.has(id)) return 0;
+    trail.add(id);
+    const depth = prerequisiteIds(task).reduce((max, parentId) => Math.max(max, depthOf(parentId, trail) + 1), 0);
+    trail.delete(id);
+    depthCache.set(id, depth);
+    return depth;
+  };
+
+  const dependents = new Map<string, string[]>();
+  for (const task of tasks) {
+    for (const parentId of prerequisiteIds(task)) {
+      const list = dependents.get(parentId) ?? [];
+      list.push(task.id);
+      dependents.set(parentId, list);
+    }
+  }
+  const descendantCount = new Map<string, number>();
+  const countDescendants = (id: string) => {
+    const cached = descendantCount.get(id);
+    if (cached !== undefined) return cached;
+    const seen = new Set<string>();
+    const stack = [...(dependents.get(id) ?? [])];
+    while (stack.length) {
+      const next = stack.pop()!;
+      if (seen.has(next)) continue;
+      seen.add(next);
+      stack.push(...(dependents.get(next) ?? []));
+    }
+    descendantCount.set(id, seen.size);
+    return seen.size;
+  };
+
+  const groups = new Map<string, TarkovTask[]>();
+  for (const task of tasks) {
+    const traderKey = task.traderId ?? "";
+    const list = groups.get(traderKey) ?? [];
+    list.push(task);
+    groups.set(traderKey, list);
+  }
+
+  const order = new Map<string, number>();
+  for (const group of groups.values()) {
+    const inGroup = new Set(group.map((task) => task.id));
+    const pending = new Map(group.map((task) => [task.id, prerequisiteIds(task).filter((id) => inGroup.has(id)).length]));
+    const placedAt = new Map<string, number>();
+    const parentRank = (task: TarkovTask) => prerequisiteIds(task).reduce(
+      (max, parentId) => Math.max(max, placedAt.get(parentId) ?? -1),
+      -1,
+    );
+    const compare = (a: TarkovTask, b: TarkovTask) =>
+      levelOf(a.id) - levelOf(b.id)
+      || a.traderLoyaltyLevel - b.traderLoyaltyLevel
+      || gateOf(a.id) - gateOf(b.id)
+      || depthOf(a.id) - depthOf(b.id)
+      || parentRank(b) - parentRank(a)
+      || countDescendants(b.id) - countDescendants(a.id)
+      || (a.nameEn || a.name).localeCompare(b.nameEn || b.name);
+
+    const ready = group.filter((task) => pending.get(task.id) === 0);
+    const ordered: TarkovTask[] = [];
+    while (ready.length) {
+      ready.sort(compare);
+      const next = ready.shift()!;
+      placedAt.set(next.id, ordered.length);
+      ordered.push(next);
+      for (const dependentId of dependents.get(next.id) ?? []) {
+        if (!inGroup.has(dependentId)) continue;
+        const remaining = (pending.get(dependentId) ?? 0) - 1;
+        pending.set(dependentId, remaining);
+        if (remaining === 0) ready.push(byId.get(dependentId)!);
+      }
+    }
+    // Cycles in upstream data: append whatever is left.
+    if (ordered.length < group.length) {
+      ordered.push(...group.filter((task) => !placedAt.has(task.id)).sort(compare));
+    }
+    ordered.forEach((task, index) => order.set(task.id, index));
+  }
+
+  return tasks.map((task) => ({ ...task, gameOrder: order.get(task.id) ?? 0 }));
 }
 
 function idsFromRefs(value: unknown): string[] {

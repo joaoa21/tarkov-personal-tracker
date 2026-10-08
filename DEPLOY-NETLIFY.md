@@ -1,4 +1,4 @@
-# Deploy no Netlify — Tarkov Personal Tracker V0.12.5
+# Deploy no Netlify — Tarkov Personal Tracker V0.13.0
 
 O projeto usa Next.js App Router e Route Handlers. O Netlify detecta Next.js automaticamente, então não é necessário instalar ou fixar manualmente o adapter/plugin do Next.js.
 
