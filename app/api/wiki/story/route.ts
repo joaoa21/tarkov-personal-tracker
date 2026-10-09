@@ -5,6 +5,8 @@ export const dynamic = "force-dynamic";
 
 const API = "https://escapefromtarkov.fandom.com/api.php";
 const CACHE_MS = 6 * 60 * 60 * 1000;
+/** A copy without the Portuguese text is retried soon instead of being kept for hours. */
+const UNTRANSLATED_CACHE_MS = 5 * 60 * 1000;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -83,24 +85,29 @@ async function loadStory(): Promise<StoryData> {
     // Images are decorative; keep the Special:FilePath fallbacks.
   }
 
+  let translationError: string | null = null;
   try {
     const [english, portuguese] = await Promise.all([gameLocale("en"), gameLocale("pt")]);
     applyPortuguese(chapters, english, portuguese);
-  } catch {
-    // Without the locale files the chapters simply stay in English.
+  } catch (error) {
+    // Without the locale files the chapters stay in English; the client says so.
+    translationError = error instanceof Error ? error.message : "locale unavailable";
   }
 
   chapters.sort((a, b) => chapterRank(a.title) - chapterRank(b.title) || a.title.localeCompare(b.title));
-  return { chapters, fetchedAt: new Date().toISOString(), source: "escapefromtarkov.fandom.com" };
+  const translatedSteps = chapters.reduce((sum, chapter) => sum + chapter.steps.filter((step) => step.textPt).length, 0);
+  return { chapters, fetchedAt: new Date().toISOString(), source: "escapefromtarkov.fandom.com", translatedSteps, translationError };
 }
 
 export async function GET() {
   try {
     if (!cache || cache.expires < Date.now()) {
-      cache = { expires: Date.now() + CACHE_MS, data: await loadStory() };
+      const data = await loadStory();
+      cache = { expires: Date.now() + (data.translatedSteps > 0 ? CACHE_MS : UNTRANSLATED_CACHE_MS), data };
     }
+    const translated = cache.data.translatedSteps > 0;
     return NextResponse.json(cache.data, {
-      headers: { "Cache-Control": "public, max-age=1800, s-maxage=21600, stale-while-revalidate=3600" },
+      headers: { "Cache-Control": translated ? "public, max-age=600, s-maxage=21600, stale-while-revalidate=3600" : "no-store" },
     });
   } catch (error) {
     // Serve a stale copy rather than nothing when the wiki hiccups.

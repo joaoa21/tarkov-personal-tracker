@@ -30,7 +30,7 @@ import {
   type ResetScope,
   type ResetSnapshot,
 } from "@/lib/storage";
-import { storyChapterProgress, type StoryChapter, type StoryData } from "@/lib/story";
+import { STORY_API_VERSION, storyChapterProgress, type StoryChapter, type StoryData } from "@/lib/story";
 import { AVATAR_PRESETS, CURRENCY_BY_ITEM_ID } from "@/lib/types";
 import type {
   CurrencyCode,
@@ -707,7 +707,7 @@ export function TrackerApp() {
     setStoryLoading(true);
     setStoryError(null);
     try {
-      const response = await fetch("/api/wiki/story");
+      const response = await fetch(`/api/wiki/story?v=${STORY_API_VERSION}`);
       const payload = await response.json() as StoryData & { error?: string };
       if (!response.ok || !Array.isArray(payload.chapters)) throw new Error(payload.error ?? "Não foi possível carregar o modo história.");
       setStory(payload);
@@ -2200,6 +2200,8 @@ function StorySection({
             </label>
             </div>
           </div>
+
+          {lang === "pt" && !(story.translatedSteps > 0) && <div className="inline-hint">A tradução oficial em português não pôde ser carregada agora{story.translationError ? ` (${story.translationError})` : ""}, então as etapas estão em inglês. <button type="button" className="link-button" onClick={onRetry}>Tentar de novo</button></div>}
 
           <div className="story-list">
             {visible.map((chapter) => (

@@ -31,10 +31,16 @@ export type StoryChapter = {
   leadsTo: string | null;
 };
 
+/** Bump when the payload shape changes so browsers/CDNs never reuse an older copy. */
+export const STORY_API_VERSION = 2;
+
 export type StoryData = {
   chapters: StoryChapter[];
   fetchedAt: string;
   source: string;
+  /** Steps that received official Portuguese text. */
+  translatedSteps: number;
+  translationError: string | null;
 };
 
 export const WIKI_BASE = "https://escapefromtarkov.fandom.com/wiki";
