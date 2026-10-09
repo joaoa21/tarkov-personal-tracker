@@ -819,8 +819,8 @@ export function TrackerApp() {
         </div>
         <div className="wallet-grid">
           <div className="wallet-stat rub"><span>RUB</span><strong>{currencyAmount("RUB", progress.wallet.RUB)}</strong></div>
-          <div className="wallet-stat usd"><span>USD</span><strong>{currencyAmount("USD", progress.wallet.USD)}</strong></div>
           <div className="wallet-stat eur"><span>EUR</span><strong>{currencyAmount("EUR", progress.wallet.EUR)}</strong></div>
+          <div className="wallet-stat usd"><span>USD</span><strong>{currencyAmount("USD", progress.wallet.USD)}</strong></div>
         </div>
         <div className="pmc-actions">
           <button type="button" className="ghost-button" onClick={() => switchView("profile")}>✎ Editar perfil</button>
@@ -958,8 +958,8 @@ export function TrackerApp() {
           <div className="profile-grid">
             <ProfileField label="Nível do PMC" prefix="LVL" value={progress.playerLevel} min={1} onChange={setPlayerLevel} />
             <ProfileField label="Rublos" prefix="₽" value={progress.wallet.RUB} onChange={(value) => setWallet("RUB", value)} />
-            <ProfileField label="Dólares" prefix="$" value={progress.wallet.USD} onChange={(value) => setWallet("USD", value)} />
             <ProfileField label="Euros" prefix="€" value={progress.wallet.EUR} onChange={(value) => setWallet("EUR", value)} />
+            <ProfileField label="Dólares" prefix="$" value={progress.wallet.USD} onChange={(value) => setWallet("USD", value)} />
           </div>
           <div className="avatar-picker-panel">
             <div className="eyebrow">PMC PORTRAIT</div>
@@ -1010,7 +1010,7 @@ export function TrackerApp() {
             </div>
             <button type="button" className="danger-button" onClick={() => setResetOpen(true)}>↺ Resetar personagem</button>
           </div>
-          <div className="currency-needs"><div className="eyebrow">HIDEOUT CASH REQUIREMENTS</div><h3>Custos monetários restantes</h3><div className="currency-cards">{(["RUB", "USD", "EUR"] as CurrencyCode[]).map((currency) => { const need = currencyNeeds.find((entry) => entry.currency === currency); return <div className="currency-card" key={currency}><span>{currency}</span><strong>{currencyAmount(currency, need?.missing ?? 0)}</strong><small>{need ? `${currencyAmount(currency, need.totalNeeded)} necessários · ${currencyAmount(currency, need.owned)} em caixa` : "Nada faltando para os upgrades restantes"}</small></div>; })}</div></div>
+          <div className="currency-needs"><div className="eyebrow">HIDEOUT CASH REQUIREMENTS</div><h3>Custos monetários restantes</h3><div className="currency-cards">{(["RUB", "EUR", "USD"] as CurrencyCode[]).map((currency) => { const need = currencyNeeds.find((entry) => entry.currency === currency); return <div className="currency-card" key={currency}><span>{currency}</span><strong>{currencyAmount(currency, need?.missing ?? 0)}</strong><small>{need ? `${currencyAmount(currency, need.totalNeeded)} necessários · ${currencyAmount(currency, need.owned)} em caixa` : "Nada faltando para os upgrades restantes"}</small></div>; })}</div></div>
         </section>
       )}
 
