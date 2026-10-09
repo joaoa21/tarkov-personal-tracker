@@ -6,6 +6,8 @@ export type StoryStep = {
   /** Stable across wiki edits that don't touch this step's text. */
   id: string;
   text: string;
+  /** Official in-game Portuguese text, when the step matched a game string. */
+  textPt: string | null;
   optional: boolean;
   /** Branch / choice this step belongs to (e.g. "If you refuse Mr. Kerman's offer"). */
   branch: string | null;
@@ -14,12 +16,14 @@ export type StoryStep = {
 export type StoryChapter = {
   id: string;
   title: string;
+  titlePt: string | null;
   wikiUrl: string;
   iconFile: string | null;
   bannerFile: string | null;
   iconUrl: string | null;
   bannerUrl: string | null;
   description: string;
+  descriptionPt: string | null;
   requirements: string[];
   rewards: string[];
   steps: StoryStep[];
@@ -134,7 +138,7 @@ function parseSteps(lines: string[], slug: string): StoryStep[] {
     const key = `${branch ?? ""}|${text}`;
     const occurrence = seen.get(key) ?? 0;
     seen.set(key, occurrence + 1);
-    steps.push({ id: `${slug}-${hash(`${key}|${occurrence}`)}`, text, optional, branch });
+    steps.push({ id: `${slug}-${hash(`${key}|${occurrence}`)}`, text, textPt: null, optional, branch });
   }
   return steps;
 }
@@ -146,6 +150,7 @@ export function parseStoryChapter(title: string, wikitext: string): StoryChapter
   return {
     id: slug,
     title: title.replace(/\s*\(story chapter\)/i, ""),
+    titlePt: null,
     wikiUrl: `${WIKI_BASE}/${encodeURIComponent(title.replace(/ /g, "_"))}`,
     iconFile: infobox(wikitext, "icon") || null,
     bannerFile: infobox(wikitext, "image") || null,
@@ -153,6 +158,7 @@ export function parseStoryChapter(title: string, wikitext: string): StoryChapter
     iconUrl: wikiFileUrl(infobox(wikitext, "icon")),
     bannerUrl: wikiFileUrl(infobox(wikitext, "image")),
     description: cleanWikiText(description),
+    descriptionPt: null,
     requirements: proseLines(section(wikitext, "Requirements")),
     rewards: proseLines(section(wikitext, "Rewards")),
     steps: parseSteps(section(wikitext, "Objectives"), slug),
@@ -166,4 +172,95 @@ export function storyChapterProgress(chapter: StoryChapter, done: Record<string,
   const required = chapter.steps.filter((step) => !step.optional);
   const completed = required.filter((step) => done[step.id]).length;
   return { completed, total: required.length };
+}
+
+// ---------------------------------------------------------------------------
+// Official Portuguese text. tarkov.dev's tasks_pt / tasks_en locale files keep
+// the story strings even though the story itself is stripped from the API, so
+// each wiki step is matched to the game's English string and swapped for the
+// game's Portuguese one.
+// ---------------------------------------------------------------------------
+
+const STOPWORDS = new Set(["the", "a", "an", "any", "to", "of", "in", "on", "at", "for", "from", "and"]);
+const OBJECTIVE_KEY = /^[0-9a-f]{24}$/;
+
+function normalizeForMatch(value: string) {
+  return value.toLowerCase().replace(/<[^>]+>/g, " ").replace(/(\d),(\d)/g, "$1$2").replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function matchWords(normalized: string) {
+  return new Set(normalized.split(" ").filter((word) => word && !STOPWORDS.has(word) && !/^\d+$/.test(word)));
+}
+
+function numbersIn(normalized: string) {
+  return normalized.split(" ").filter((word) => /^\d+$/.test(word));
+}
+
+type LocaleIndex = {
+  exact: Map<string, string>;
+  candidates: Array<{ key: string; normalized: string; words: Set<string> }>;
+};
+
+function buildLocaleIndex(english: Record<string, unknown>): LocaleIndex {
+  const exact = new Map<string, string>();
+  const candidates: LocaleIndex["candidates"] = [];
+  for (const [key, value] of Object.entries(english)) {
+    if (typeof value !== "string" || !value.trim()) continue;
+    const normalized = normalizeForMatch(value);
+    if (!exact.has(normalized)) exact.set(normalized, key);
+    if (OBJECTIVE_KEY.test(key)) candidates.push({ key, normalized, words: matchWords(normalized) });
+  }
+  return { exact, candidates };
+}
+
+function dice(a: Set<string>, b: Set<string>) {
+  if (!a.size || !b.size) return 0;
+  let shared = 0;
+  for (const word of a) if (b.has(word)) shared += 1;
+  return (2 * shared) / (a.size + b.size);
+}
+
+/** Portuguese for an English wiki line, or null when no game string is close enough. */
+function translateLine(text: string, index: LocaleIndex, portuguese: Record<string, unknown>, fuzzy: boolean) {
+  const normalized = normalizeForMatch(text);
+  const exactKey = index.exact.get(normalized);
+  const exactPt = exactKey ? portuguese[exactKey] : null;
+  if (typeof exactPt === "string" && exactPt.trim()) return exactPt.trim();
+  if (!fuzzy) return null;
+
+  const words = matchWords(normalized);
+  if (words.size < 2) return null;
+  const sourceNumbers = new Set(numbersIn(normalized));
+  let best: { key: string; normalized: string; score: number } | null = null;
+  for (const candidate of index.candidates) {
+    // The game string must say the same thing as the wiki line: nothing extra
+    // ("... on Interchange"), no different numbers ("5.0" vs "4.0"), and at
+    // most one wiki word left out, so choices like "keep it or hand it over"
+    // are never collapsed into one of the options.
+    let extraWord = false;
+    for (const word of candidate.words) if (!words.has(word)) { extraWord = true; break; }
+    if (extraWord) continue;
+    if (words.size - candidate.words.size > 1) continue;
+    if (numbersIn(candidate.normalized).some((value) => !sourceNumbers.has(value))) continue;
+    const score = dice(words, candidate.words);
+    if (!best || score > best.score) best = { key: candidate.key, normalized: candidate.normalized, score };
+  }
+  if (!best) return null;
+  const pt = portuguese[best.key];
+  if (typeof pt !== "string" || !pt.trim()) return null;
+  // The wiki often spells out counts ("Eliminate any 15 targets") that the
+  // game shows in a separate counter; keep them visible.
+  const candidateNumbers = new Set([...numbersIn(best.normalized), ...numbersIn(normalizeForMatch(pt.replace(/(\d)\.(\d{3})/g, "$1$2")))]);
+  const extra = numbersIn(normalized).filter((value) => !candidateNumbers.has(value)).map((value) => Number(value).toLocaleString("pt-BR"));
+  return extra.length ? `${pt.trim()} (${extra.join(", ")})` : pt.trim();
+}
+
+export function applyPortuguese(chapters: StoryChapter[], english: Record<string, unknown>, portuguese: Record<string, unknown>) {
+  const index = buildLocaleIndex(english);
+  for (const chapter of chapters) {
+    chapter.titlePt = translateLine(chapter.title, index, portuguese, false);
+    chapter.descriptionPt = chapter.description ? translateLine(chapter.description, index, portuguese, false) : null;
+    for (const step of chapter.steps) step.textPt = translateLine(step.text, index, portuguese, true);
+  }
+  return chapters;
 }

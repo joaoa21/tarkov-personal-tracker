@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { chapterRank, parseStoryChapter, type StoryChapter, type StoryData } from "@/lib/story";
+import { applyPortuguese, chapterRank, parseStoryChapter, type StoryChapter, type StoryData } from "@/lib/story";
 
 export const dynamic = "force-dynamic";
 
@@ -57,6 +57,14 @@ async function resolveImages(fileNames: string[]): Promise<Map<string, string>> 
   return resolved;
 }
 
+async function gameLocale(lang: "en" | "pt"): Promise<JsonRecord> {
+  // The story is shared by every mode; its strings survive in the tasks locale files.
+  const response = await fetch(`https://json.tarkov.dev/regular/tasks_${lang}`, { cache: "no-store", headers: { Accept: "application/json" } });
+  if (!response.ok) throw new Error(`tasks_${lang} HTTP ${response.status}`);
+  const payload = await response.json() as unknown;
+  return isRecord(payload) && isRecord(payload.data) ? payload.data : {};
+}
+
 async function loadStory(): Promise<StoryData> {
   const titles = await chapterTitles();
   if (!titles.length) throw new Error("No story chapters found on the wiki");
@@ -73,6 +81,13 @@ async function loadStory(): Promise<StoryData> {
     }
   } catch {
     // Images are decorative; keep the Special:FilePath fallbacks.
+  }
+
+  try {
+    const [english, portuguese] = await Promise.all([gameLocale("en"), gameLocale("pt")]);
+    applyPortuguese(chapters, english, portuguese);
+  } catch {
+    // Without the locale files the chapters simply stay in English.
   }
 
   chapters.sort((a, b) => chapterRank(a.title) - chapterRank(b.title) || a.title.localeCompare(b.title));

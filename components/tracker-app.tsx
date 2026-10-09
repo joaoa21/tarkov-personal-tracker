@@ -2138,6 +2138,13 @@ function StorySection({
 }) {
   const [filter, setFilter] = useState<StoryFilter>("all");
   const [hideDone, setHideDone] = useState(false);
+  const [lang, setLangState] = useState<"pt" | "en">(() => {
+    try { return typeof window !== "undefined" && window.localStorage.getItem("tarkov-personal-tracker:story-lang") === "en" ? "en" : "pt"; } catch { return "pt"; }
+  });
+  const setLang = (next: "pt" | "en") => {
+    setLangState(next);
+    try { window.localStorage.setItem("tarkov-personal-tracker:story-lang", next); } catch { /* per-viewer convenience only */ }
+  };
   const [openIds, setOpenIds] = useState<Set<string> | null>(null);
   const chapters = story?.chapters ?? [];
 
@@ -2161,7 +2168,7 @@ function StorySection({
         <div>
           <div className="eyebrow">STORY MODE</div>
           <h2>Modo história</h2>
-          <p>Capítulos da história com todas as etapas, inclusive os caminhos de cada escolha e final. <b>Tour</b> abre a história e <b>The Ticket</b> é o capítulo final; os demais começam quando você acha o item ou local que os ativa e podem correr em paralelo. Dados da Wiki oficial (em inglês) — o tarkov.dev ainda não publica a história na API.</p>
+          <p>Capítulos da história com todas as etapas, inclusive os caminhos de cada escolha e final. <b>Tour</b> abre a história e <b>The Ticket</b> é o capítulo final; os demais começam quando você acha o item ou local que os ativa e podem correr em paralelo. Etapas da Wiki oficial (o tarkov.dev ainda não publica a história na API), com o texto oficial do jogo em português sempre que a etapa bate com ele.</p>
         </div>
         {story && <a className="ghost-button story-wiki-link" href="https://escapefromtarkov.fandom.com/wiki/Story_chapters" target="_blank" rel="noreferrer">Story chapters na Wiki ↗</a>}
       </div>
@@ -2182,10 +2189,16 @@ function StorySection({
                 <button key={id} type="button" className={filter === id ? "subtab active" : "subtab"} onClick={() => setFilter(id)}>{label}<b>{count}</b></button>
               ))}
             </div>
+            <div className="story-toolbar-right">
+              <div className="segmented" role="group" aria-label="Idioma das etapas">
+                <button type="button" className={lang === "pt" ? "active" : ""} onClick={() => setLang("pt")}>PT-BR</button>
+                <button type="button" className={lang === "en" ? "active" : ""} onClick={() => setLang("en")}>EN</button>
+              </div>
             <label className="toggle-chip">
               <input type="checkbox" checked={hideDone} onChange={(event) => setHideDone(event.target.checked)} />
               <span>Ocultar etapas feitas</span>
             </label>
+            </div>
           </div>
 
           <div className="story-list">
@@ -2196,6 +2209,7 @@ function StorySection({
                 progress={progress}
                 open={open.has(chapter.id)}
                 hideDone={hideDone}
+                lang={lang}
                 onToggle={() => toggle(chapter.id)}
                 onStep={onStep}
                 onChapterDone={onChapterDone}
@@ -2215,6 +2229,7 @@ function StoryChapterCard({
   progress,
   open,
   hideDone,
+  lang,
   onToggle,
   onStep,
   onChapterDone,
@@ -2224,6 +2239,7 @@ function StoryChapterCard({
   progress: ProfileProgress;
   open: boolean;
   hideDone: boolean;
+  lang: "pt" | "en";
   onToggle: () => void;
   onStep: (stepId: string, done: boolean) => void;
   onChapterDone: (chapter: StoryChapter, done: boolean) => void;
@@ -2244,7 +2260,7 @@ function StoryChapterCard({
         </div>
         <div className="story-head-copy">
           <span className={`story-state ${state}`}>{stateLabel}</span>
-          <h3>{chapter.title}</h3>
+          <h3>{lang === "pt" && chapter.titlePt ? dual(chapter.titlePt, chapter.title) : chapter.title}</h3>
           <div className="story-progress"><i style={{ width: `${percent}%` }} /></div>
           <small>{stats.completed}/{stats.total} etapas obrigatórias{chapter.steps.length > stats.total ? ` · ${chapter.steps.length - stats.total} opcionais` : ""}</small>
         </div>
@@ -2253,7 +2269,7 @@ function StoryChapterCard({
 
       {open && (
         <div className="story-body">
-          {chapter.description && <blockquote className="story-quote">{chapter.description}</blockquote>}
+          {chapter.description && <blockquote className="story-quote">{lang === "pt" ? chapter.descriptionPt ?? chapter.description : chapter.description}</blockquote>}
 
           {chapter.requirements.length > 0 && (
             <div className="story-requirements">
@@ -2272,7 +2288,7 @@ function StoryChapterCard({
                   <label className={`story-step${done ? " done" : ""}${step.optional ? " optional" : ""}`}>
                     <input type="checkbox" checked={done} onChange={(event) => onStep(step.id, event.target.checked)} />
                     <span className="story-check" />
-                    <span className="story-step-text">{step.text}</span>
+                    <span className="story-step-text" title={lang === "pt" && step.textPt ? step.text : undefined}>{lang === "pt" ? step.textPt ?? step.text : step.text}</span>
                     {step.optional && <em>Opcional</em>}
                   </label>
                 </div>
