@@ -2137,7 +2137,13 @@ function StorySection({
   onClearChapter: (chapter: StoryChapter) => void;
 }) {
   const [filter, setFilter] = useState<StoryFilter>("all");
-  const [hideDone, setHideDone] = useState(false);
+  const [hideDone, setHideDoneState] = useState(() => {
+    try { return typeof window !== "undefined" && window.localStorage.getItem("tarkov-personal-tracker:story-hide-done") === "1"; } catch { return false; }
+  });
+  const setHideDone = (next: boolean) => {
+    setHideDoneState(next);
+    try { window.localStorage.setItem("tarkov-personal-tracker:story-hide-done", next ? "1" : "0"); } catch { /* per-viewer convenience only */ }
+  };
   const [lang, setLangState] = useState<"pt" | "en">(() => {
     try { return typeof window !== "undefined" && window.localStorage.getItem("tarkov-personal-tracker:story-lang") === "en" ? "en" : "pt"; } catch { return "pt"; }
   });
